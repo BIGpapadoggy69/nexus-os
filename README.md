@@ -13,6 +13,7 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Dependencies](https://img.shields.io/badge/Abh%C3%A4ngigkeiten-0-10b981?style=for-the-badge)](#%EF%B8%8F-technik)
 [![Local](https://img.shields.io/badge/l%C3%A4uft-100%25%20lokal-a855f7?style=for-the-badge)](#-sicherheit--datenschutz)
+[![License](https://img.shields.io/badge/Lizenz-MIT-f59e0b?style=for-the-badge)](LICENSE)
 
 <br>
 
@@ -306,6 +307,12 @@ Nicht jedes Laufwerk meldet Temperatur, Verschleiß und Betriebsstunden an Windo
 - System-Daten direkt über Win32-APIs per `ctypes`: `GetIfTable2` (Netzwerk), `GetSystemTimes` (CPU), `IcmpSendEcho` (Ping), Toolhelp32 (Prozesse), `SHFileOperation` (Papierkorb)
 - Oberfläche: eine HTML-Seite mit Vanilla JS & CSS, lokal ausgeliefert und als Chromium-App-Fenster geöffnet
 - Bildkonvertierung über WPF/WIC, eigener PDF-Writer, Audio/Video über ffmpeg
+
+---
+
+## 📄 Lizenz
+
+[MIT](LICENSE) © BIGpapadoggy69: Du darfst den Code frei nutzen, ändern und weitergeben, auch in eigenen Projekten, solange der Lizenzhinweis erhalten bleibt.
 
 ---
 
