@@ -1664,7 +1664,7 @@ DEFAULT_SETTINGS = {
     "animations": True,
     "show_console": True,
     "nav_numbers": True,
-    "brand_name": "MONOLITH // NEXUS OS",
+    "brand_name": "NEXUS OS",
     "brand_tag": "v10.0 QUANTUM KERNEL",
     "hidden_views": [],
     "dash_hidden": [],
@@ -1766,8 +1766,13 @@ SETTING_RANGES = {  # Schieberegler: (min, max)
 SETTING_TEXTS = {"brand_name": 32, "brand_tag": 24, "welcome_name": 32, "ai_voice_name": 80}
 DASH_SECTIONS = ("hero", "metrics", "monitor", "bottom")
 
+OLD_BRAND_NAMES = ("MONOLITH // NEXUS OS",)  # frühere Standardnamen, die automatisch ersetzt werden
+
 def get_settings():
-    return dict(DEFAULT_SETTINGS, **USER_DATA["settings"])
+    s = dict(DEFAULT_SETTINGS, **USER_DATA["settings"])
+    if s["brand_name"] in OLD_BRAND_NAMES:
+        s["brand_name"] = DEFAULT_SETTINGS["brand_name"]
+    return s
 
 def save_settings(payload):
     s = get_settings()
@@ -4956,14 +4961,14 @@ def ai_status(since):
 
 
 # =====================================================================
-# MONOLITH // NEXUS OS FRONTEND v10.0 QUANTUM
+# NEXUS OS FRONTEND v10.0
 # =====================================================================
 
 HTML_UI = r"""<!DOCTYPE html>
 <html lang="de">
 <head>
 <meta charset="UTF-8">
-<title>MONOLITH // NEXUS OS v10.0 QUANTUM</title>
+<title>NEXUS OS</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
@@ -6386,7 +6391,7 @@ HTML_UI = r"""<!DOCTYPE html>
 <header class="topbar">
   <div class="brand">
     <div class="brand-mark"></div>
-    <span class="brand-name">MONOLITH // NEXUS OS</span>
+    <span class="brand-name">NEXUS OS</span>
     <span class="version-pill">v10.0 QUANTUM KERNEL</span>
   </div>
   <div class="topbar-right">
@@ -7782,7 +7787,7 @@ HTML_UI = r"""<!DOCTYPE html>
     <!-- KERNEL LOG CONSOLE -->
     <div class="card console-card">
       <div class="section-label" style="margin-bottom:4px;">
-        <span>MONOLITH // NEXUS Quantum Kernel Stream</span>
+        <span>NEXUS Kernel Stream</span>
         <span id="console-status">READY</span>
       </div>
       <div id="console-output"></div>
@@ -9342,7 +9347,7 @@ const DEFAULT_DESIGN = {
 const DESIGN_KEYS = Object.keys(DEFAULT_DESIGN);
 let settings = {
   ...DEFAULT_DESIGN, sound: true, start_view: 'view-dash', monitor_interval: 1, refresh_interval: 5,
-  brand_name: 'MONOLITH // NEXUS OS', brand_tag: 'v10.0 QUANTUM KERNEL', hidden_views: [], dash_hidden: [],
+  brand_name: 'NEXUS OS', brand_tag: 'v10.0 QUANTUM KERNEL', hidden_views: [], dash_hidden: [],
   welcome: true, welcome_style: 'stats', welcome_duration: 2500, welcome_name: '',
   toasts: 'all', toast_pos: 'bottom-right', toast_duration: 5, clock_format: '24', clock_seconds: true,
   browser: 'brave', ai_listen: false, ai_voice: true, ai_voice_name: '', ai_voice_style: 'cozy', ai_sound: 'soft',
@@ -11457,7 +11462,7 @@ window.addEventListener('load', async () => {
 # kennen ihn nicht und können die Admin-API deshalb nicht per Cross-Site-Request auslösen.
 API_TOKEN = secrets.token_urlsafe(32)
 
-class NexusMonolithHandler(BaseHTTPRequestHandler):
+class NexusHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
@@ -11983,7 +11988,7 @@ class NexusMonolithHandler(BaseHTTPRequestHandler):
 
 
 def launch_window(url):
-    profile_dir = os.path.join(tempfile.gettempdir(), "Monolith_Nexus_Quantum_Profile")
+    profile_dir = os.path.join(tempfile.gettempdir(), "NexusOS_Window_Profile")
     browsers = [
         r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -12011,7 +12016,7 @@ def main():
     # Erst nach load_user_data starten, sonst laufen "Beim NEXUS-Start"-Automationen gegen leere Daten ins Leere
     threading.Thread(target=automation_loop, daemon=True).start()
     threading.Thread(target=ai_loop, daemon=True).start()
-    server =ThreadingHTTPServer(("127.0.0.1", 0), NexusMonolithHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), NexusHandler)
     url = f"http://127.0.0.1:{server.server_port}"
     threading.Thread(target=launch_window, args=(url,), daemon=True).start()
     try:

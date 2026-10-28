@@ -275,12 +275,27 @@ cd nexus-os
 python nexus.py
 ```
 
-Oder einfach oben auf **Code → Download ZIP** klicken, entpacken und `nexus.py` doppelklicken.
+Oder einfach oben auf **Code → Download ZIP** klicken, entpacken und `nexus.py` doppelklicken. Eine bestimmte (auch ältere) Version gibt es unter [**Releases**](https://github.com/BIGpapadoggy69/nexus-os/releases).
 
 Windows fragt einmal nach Admin-Rechten (die braucht das Tool für Registry- und Netzwerk-Einstellungen), dann öffnet sich NEXUS OS in einem eigenen Fenster. Keine Installation, kein `pip install`, nichts.
 
 > [!TIP]
 > Unter **Einstellungen → Allgemein → Mit Windows starten** läuft NEXUS ab dem Login automatisch. Dann greifen auch Erinnerungen, Auto-Sortierung und Automationen den ganzen Tag.
+
+---
+
+## 📦 Versionen & Downloads
+
+Jedes große Update erscheint als eigene Version unter [**Releases**](https://github.com/BIGpapadoggy69/nexus-os/releases). Bei jeder Version liegt die passende `nexus.py` zum Download – so kannst du jederzeit bei einer älteren Version bleiben oder zurückwechseln.
+
+| Version | Highlights |
+|---|---|
+| [**v3.0.0**](https://github.com/BIGpapadoggy69/nexus-os/releases/tag/v3.0.0) | Big UI-Update: Video-Hintergründe, Live-Hintergründe, Glas & Effekte, Looks |
+| [**v2.0.0**](https://github.com/BIGpapadoggy69/nexus-os/releases/tag/v2.0.0) | NEXUS AI: Sprachassistent „Hey Nexus“, natürliche Stimmen, lokales KI-Gehirn |
+| [**v1.0.0**](https://github.com/BIGpapadoggy69/nexus-os/releases/tag/v1.0.0) | Erste Version: Dashboard, Automationen, File Converter, Netz-Diagnose, Alltag |
+
+> [!NOTE]
+> Deine Daten in `%APPDATA%\NexusOS` bleiben beim Wechseln erhalten; ältere Versionen ignorieren Einstellungen, die sie noch nicht kennen. Einzige Ausnahme: v1 und v2 vergessen beim Speichern die Liste deiner eigenen Hintergründe (die Dateien selbst bleiben im Ordner). Exportier vorher unter **Einstellungen → Allgemein → Deine Daten** ein Backup und importier es nach dem Zurückwechseln wieder.
 
 ---
 
