@@ -6,7 +6,7 @@
 
 **Dein ganzer Windows-PC in einem Dashboard.**
 
-Sprachassistent „Hey Nexus“ · Live-Monitor · Automationen · File Converter · Speedtest · Workspaces · 5 Themes<br>
+Sprachassistent „Hey Nexus“ · Video-Hintergründe · Glas-UI · Live-Monitor · Automationen · File Converter · Workspaces<br>
 alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkeit.
 
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#-installation)
@@ -19,7 +19,7 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
 
 <img src="docs/screenshots/dashboard.png" alt="NEXUS OS Dashboard mit Live-Monitor" width="100%">
 
-<sub>Dashboard im Look „Midnight · Glas · Aurora · Farbverlauf“, einer von unzähligen Kombinationen</sub>
+<sub>Dashboard mit eigenem Hintergrund, Glas-Karten und Partikeln – einer von unzähligen Looks</sub>
 
 <br><br>
 
@@ -58,9 +58,9 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
       Auslöser: Programmstart/-ende, Uhrzeit, Intervall, App-Start. Ganz ohne Skripten.
     </td>
     <td width="33%" valign="top">
-      <h3>🎨 Komplett anpassbar</h3>
-      5 Themes inkl. Light Mode, Glas-Karten, Aurora-Hintergrund, Farbverläufe, Schriften, Animationen und mehr.
-      Teile deinen Look per <b>Design-Code</b>.
+      <h3>🎨 Unnormal anpassbar</h3>
+      Eigenes <b>Video, GIF oder Bild als Hintergrund</b>, Glas-Regler, Partikel, Sterne & Mesh, 8 Looks mit einem Klick und Akzentfarben direkt aus deinem Video.
+      Teilbar per <b>Design-Code</b>.
     </td>
     <td width="33%" valign="top">
       <h3>🗂️ File Converter</h3>
@@ -95,6 +95,14 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
 
 <table>
   <tr>
+    <td width="50%"><img src="docs/screenshots/backgrounds.png" alt="Eigener Hintergrund"><br><sub><b>Hintergrund</b>: eigenes Video, GIF oder Bild + Live-Hintergründe</sub></td>
+    <td width="50%"><img src="docs/screenshots/looks.png" alt="Looks"><br><sub><b>Looks</b>: komplette Designs mit einem Klick</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/effects.png" alt="Glas und Effekte"><br><sub><b>Glas & Effekte</b>: Deckkraft, Unschärfe, Neon-Rahmen, Glanz, UI-Größe</sub></td>
+    <td width="50%"><img src="docs/screenshots/theme-cyber.png" alt="Look Cyber Neon"><br><sub><b>Cyber Neon</b>: OLED · Partikel · Neon-Rahmen · Terminal-Schrift</sub></td>
+  </tr>
+  <tr>
     <td width="50%"><img src="docs/screenshots/welcome.png" alt="Welcome-Screen"><br><sub><b>Welcome-Screen</b>: begrüßt dich mit Namen und PC-Namen</sub></td>
     <td width="50%"><img src="docs/screenshots/palette.png" alt="Befehlssuche Strg+K"><br><sub><b>Strg + K</b>: Befehlssuche für alles</sub></td>
   </tr>
@@ -108,7 +116,7 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
   </tr>
   <tr>
     <td width="50%"><img src="docs/screenshots/commands.png" alt="Custom Commands"><br><sub><b>Custom Commands</b>: eigene CMD-/PowerShell-Befehle mit Ausgabe</sub></td>
-    <td width="50%"><img src="docs/screenshots/settings.png" alt="Einstellungen"><br><sub><b>Einstellungen</b>: 5 Tabs voller Design-Optionen</sub></td>
+    <td width="50%"><img src="docs/screenshots/settings.png" alt="Einstellungen"><br><sub><b>Einstellungen</b>: Theme, Farben, Schrift, Layout und mehr</sub></td>
   </tr>
 </table>
 
@@ -232,7 +240,12 @@ Bilder laufen über die in Windows eingebauten Codecs (WPF/WIC). Für Audio und 
 <details>
 <summary><b>🎨 Design & Komfort</b></summary>
 
-- **Aussehen:** Midnight, Graphite, OLED, Nord, Light · Akzentfarbe + Farbverlauf · Kartenstil Solid / Glas / Outline / Schwebend · Hintergrund Raster / Punkte / Aurora / Körnung · hoher Kontrast
+- **Eigener Hintergrund:** Video (MP4, WebM, MOV), GIF oder Bild per Drag & Drop hochladen, bis 1 GB, eigene Bibliothek mit Vorschau. Regler für Deckkraft, Unschärfe, Abdunkeln, Helligkeit, Sättigung und Video-Tempo; Vignette, „Kamerafahrt“ für Standbilder, Video pausiert automatisch, wenn NEXUS im Hintergrund ist
+- **Akzentfarben aus dem Hintergrund:** ein Klick zieht die zwei kräftigsten Farben aus deinem Video oder Bild
+- **Live-Hintergründe:** Mesh-Verlauf, Aurora, Partikel (reagieren auf die Maus), Sterne mit Sternschnuppen, Raster, Punkte, Körnung – auch über dem eigenen Video
+- **Glas & Effekte:** Glas-Deckkraft und -Unschärfe für Karten, Seitenleiste, Dialoge und Hinweise · Leucht-Intensität · Neon-Rahmen · Glanz auf Buttons · Lesbarkeits-Schatten · Größe der Oberfläche (80–125 %)
+- **Looks:** Frosted Glass, Cyber Neon, Sunset Drive, Deep Space, Nordic Calm, Matrix, Clean Light, Classic – je ein Klick
+- **Aussehen:** Midnight, Graphite, OLED, Nord, Light · Akzentfarbe + Farbverlauf · Kartenstil Solid / Glas / Outline / Schwebend · hoher Kontrast
 - **Layout:** 5 Schriftarten, 5 Größen, Ecken, Pill-Buttons, Abstände, Seitenleiste links oder rechts, Breite, Scrollbalken
 - **Bewegung:** Seitenübergänge Pop / Slide / Zoom / Blur, Tempo, schwebende Karten
 - **Start & Hinweise:** Welcome-Screen, Toast-Benachrichtigungen (Position, Dauer), 12/24-h-Uhr
@@ -311,6 +324,7 @@ In der Suche funktionieren außerdem Rechnungen (`=2^10/4`) und Websuchen: einfa
 |---|---|
 | `%APPDATA%\NexusOS\user_data.json` | Workspaces, Erinnerungen, Notizen, Bausteine, Befehle, Automationen, Einstellungen |
 | `%PROGRAMDATA%\NexusOS\original_ids.json` | Gesicherte Original-Werte für „Alles auf Original“ |
+| `%APPDATA%\NexusOS\backgrounds\` | Deine hochgeladenen Hintergründe (Kopien, die Originale bleiben, wo sie sind) |
 | `%APPDATA%\NexusOS\ai\` | Sprach-Engine (wird beim ersten Start kompiliert), Wortschatz für die Erkennung und, falls gewählt, natürliche Piper-Stimmen |
 
 > [!WARNING]
@@ -366,6 +380,7 @@ Nicht jedes Laufwerk meldet Temperatur, Verschleiß und Betriebsstunden an Windo
 - **Eine Datei, null Abhängigkeiten:** nur die Python-Standardbibliothek (`http.server`, `ctypes`, `winreg`, …)
 - System-Daten direkt über Win32-APIs per `ctypes`: `GetIfTable2` (Netzwerk), `GetSystemTimes` (CPU), `IcmpSendEcho` (Ping), Toolhelp32 (Prozesse), `SHFileOperation` (Papierkorb)
 - Oberfläche: eine HTML-Seite mit Vanilla JS & CSS, lokal ausgeliefert und als Chromium-App-Fenster geöffnet
+- Hintergründe: Upload wird direkt auf die Platte gestreamt, Videos mit HTTP-Range-Anfragen ausgeliefert (sauberes Loopen und Spulen); Partikel und Sterne laufen auf einem Canvas mit `requestAnimationFrame` und pausieren im Hintergrund
 - Bildkonvertierung über WPF/WIC, eigener PDF-Writer, Audio/Video über ffmpeg
 - Sprache: ein kleiner C#-Host auf Basis von `System.Speech` wird beim ersten Start per PowerShell kompiliert und zwischengespeichert. Die Grammatik entsteht aus deinen Startmenü-Apps (`Get-StartApps`), Workspaces und Befehlen; das Wakeword wird über die Wort-Konfidenz von „Nexus“ geprüft, damit normales Reden nichts auslöst.
 

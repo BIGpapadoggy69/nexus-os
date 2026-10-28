@@ -1320,6 +1320,7 @@ USER_DATA = {
     "commands": [],
     "settings": {},
     "automations": [],
+    "backgrounds": [],
 }
 DATA_LOCK = threading.RLock()
 
@@ -1690,6 +1691,25 @@ DEFAULT_SETTINGS = {
     "toast_duration": 5,
     "clock_format": "24",
     "clock_seconds": True,
+    # Eigener Hintergrund (Video/Bild/GIF) & Glas-Effekte
+    "bg_media": "",
+    "bg_opacity": 100,
+    "bg_blur": 0,
+    "bg_dim": 45,
+    "bg_brightness": 100,
+    "bg_saturation": 100,
+    "bg_speed": 100,
+    "bg_fit": "cover",
+    "bg_vignette": True,
+    "bg_kenburns": True,
+    "bg_pause_hidden": True,
+    "glass_opacity": 60,
+    "glass_blur": 18,
+    "glow_strength": 100,
+    "ui_scale": 100,
+    "border_glow": False,
+    "text_shadow": False,
+    "btn_shine": False,
     "browser": "brave",
     # NEXUS AI (Mikrofon standardmäßig aus)
     "ai_listen": False,
@@ -1711,7 +1731,8 @@ SETTING_CHOICES = {
     "font_size": (14, 15, 16, 17, 18),
     "radius": ("sharp", "normal", "round"),
     "density": ("compact", "normal", "cozy"),
-    "pattern": ("none", "grid", "dots", "aurora", "noise"),
+    "pattern": ("none", "grid", "dots", "aurora", "noise", "mesh", "particles", "stars"),
+    "bg_fit": ("cover", "contain"),
     "card_style": ("solid", "glass", "outline", "elevated"),
     "contrast": ("normal", "high"),
     "button_shape": ("normal", "pill"),
@@ -1735,7 +1756,13 @@ SETTING_CHOICES = {
 }
 SETTING_BOOLS = ("sound", "glow", "animations", "show_console", "nav_numbers", "accent_gradient",
                  "mono_values", "hover_lift", "welcome", "clock_seconds",
-                 "ai_listen", "ai_voice", "ai_llm", "ai_web_fallback")
+                 "ai_listen", "ai_voice", "ai_llm", "ai_web_fallback",
+                 "bg_vignette", "bg_kenburns", "bg_pause_hidden", "border_glow", "text_shadow", "btn_shine")
+SETTING_RANGES = {  # Schieberegler: (min, max)
+    "bg_opacity": (0, 100), "bg_blur": (0, 40), "bg_dim": (0, 95), "bg_brightness": (40, 160),
+    "bg_saturation": (0, 200), "bg_speed": (25, 200), "glass_opacity": (5, 100), "glass_blur": (0, 40),
+    "glow_strength": (0, 200), "ui_scale": (80, 125),
+}
 SETTING_TEXTS = {"brand_name": 32, "brand_tag": 24, "welcome_name": 32, "ai_voice_name": 80}
 DASH_SECTIONS = ("hero", "metrics", "monitor", "bottom")
 
@@ -1759,6 +1786,16 @@ def save_settings(payload):
             s[key] = value
         elif key in SETTING_BOOLS:
             s[key] = bool(value)
+        elif key in SETTING_RANGES:
+            lo, hi = SETTING_RANGES[key]
+            try:
+                s[key] = max(lo, min(hi, int(round(float(value)))))
+            except (TypeError, ValueError):
+                raise ValueError(f"Ungültiger Wert für {key}")
+        elif key == "bg_media":
+            if value and not any(b["id"] == value for b in USER_DATA["backgrounds"]):
+                raise ValueError("Hintergrund nicht gefunden")
+            s[key] = value or ""
         elif key in SETTING_TEXTS:
             text = str(value or "").strip()
             if len(text) > SETTING_TEXTS[key]:
@@ -1813,6 +1850,74 @@ def import_user_data(data):
             USER_DATA[k] = data[k]
         save_user_data()
     return imported
+
+# ---------------- Eigene Hintergründe (Video, GIF, Bild) ----------------
+# Der Nutzer lädt sie bewusst in den Einstellungen hoch; NEXUS kopiert sie in den eigenen Ordner,
+# damit der Hintergrund auch bleibt, wenn das Original verschoben wird.
+
+BG_DIR = os.path.join(os.path.dirname(DATA_FILE), "backgrounds")
+BG_TYPES = {".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/mp4", ".webm": "video/webm",
+            ".gif": "image/gif", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".webp": "image/webp", ".avif": "image/avif"}
+BG_MAX_BYTES = 1024 ** 3
+BG_MAX_COUNT = 30
+
+def bg_path(entry):
+    return os.path.join(BG_DIR, entry["id"] + entry["ext"])
+
+def list_backgrounds():
+    with DATA_LOCK:
+        return [b for b in USER_DATA["backgrounds"] if os.path.exists(bg_path(b))]
+
+def receive_background(stream, length, raw_name):
+    name = urllib.parse.unquote(raw_name or "").strip()[:160] or "Hintergrund"
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in BG_TYPES:
+        raise ValueError("Bitte ein Video (MP4, WebM, MOV), ein GIF oder ein Bild (JPG, PNG, WebP)")
+    if length <= 0:
+        raise ValueError("Die Datei ist leer")
+    if length > BG_MAX_BYTES:
+        raise ValueError("Die Datei ist zu groß (maximal 1 GB)")
+    if len(list_backgrounds()) >= BG_MAX_COUNT:
+        raise ValueError(f"Maximal {BG_MAX_COUNT} Hintergründe – lösch erst einen alten")
+    os.makedirs(BG_DIR, exist_ok=True)
+    entry = {"id": uuid.uuid4().hex[:12], "name": os.path.splitext(name)[0][:60], "ext": ext,
+             "kind": "video" if BG_TYPES[ext].startswith("video") else "image", "size": length, "added": time.time()}
+    path, remaining = bg_path(entry), length
+    try:
+        # In Stücken auf die Platte, damit ein großes Video nicht komplett im Arbeitsspeicher landet
+        with open(path, "wb") as f:
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError("Upload abgebrochen")
+                f.write(chunk)
+                remaining -= len(chunk)
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    with DATA_LOCK:
+        USER_DATA["backgrounds"].append(entry)
+        save_user_data()
+    return {"id": entry["id"], "backgrounds": list_backgrounds()}
+
+def delete_background(bg_id):
+    with DATA_LOCK:
+        entry = next((b for b in USER_DATA["backgrounds"] if b["id"] == bg_id), None)
+        if not entry:
+            raise ValueError("Hintergrund nicht gefunden")
+        USER_DATA["backgrounds"].remove(entry)
+        if USER_DATA["settings"].get("bg_media") == bg_id:
+            USER_DATA["settings"]["bg_media"] = ""
+        save_user_data()
+    try:
+        os.remove(bg_path(entry))
+    except OSError:
+        pass  # Datei spielt evtl. noch im Fenster; der Eintrag ist trotzdem weg
+    return {"backgrounds": list_backgrounds(), "settings": get_settings()}
 
 AUTOSTART_TASK = "NexusOS Autostart"
 
@@ -5691,15 +5796,29 @@ HTML_UI = r"""<!DOCTYPE html>
     100% { transform: translate(2%, -3%) scale(1.03); }
   }
 
-  /* ---------- Kartenstile ---------- */
+  /* ---------- Kartenstile (Glas: Deckkraft & Unschärfe kommen aus den Reglern) ---------- */
   body.card-glass .card, body.card-glass .sidebar-footer {
-    background: color-mix(in srgb, var(--surface) 55%, transparent);
-    backdrop-filter: blur(18px) saturate(150%);
+    background: color-mix(in srgb, var(--surface) var(--glass-alpha, 60%), transparent);
+    backdrop-filter: blur(var(--glass-blur, 18px)) saturate(150%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
   }
+  body.card-glass .console-card { background: color-mix(in srgb, var(--input-bg) var(--glass-alpha, 60%), transparent); }
   body.card-glass .metric-box, body.card-glass .tweak-row, body.card-glass .list-row {
-    background: color-mix(in srgb, var(--surface-2) 40%, transparent);
+    background: color-mix(in srgb, var(--surface-2) calc(var(--glass-alpha, 60%) * 0.65), transparent);
   }
-  body.card-glass .sidebar { background: color-mix(in srgb, var(--surface) 35%, transparent); backdrop-filter: blur(18px); }
+  body.card-glass input[type="text"], body.card-glass input[type="number"], body.card-glass select,
+  body.card-glass textarea, body.card-glass .seg {
+    background: color-mix(in srgb, var(--input-bg) calc(var(--glass-alpha, 60%) + 15%), transparent);
+  }
+  body.card-glass .sidebar {
+    background: color-mix(in srgb, var(--surface) calc(var(--glass-alpha, 60%) * 0.6), transparent);
+    backdrop-filter: blur(var(--glass-blur, 18px)) saturate(140%);
+  }
+  body.card-glass .topbar { background: color-mix(in srgb, var(--bg) calc(var(--glass-alpha, 60%) * 0.85), transparent); }
+  body.card-glass .modal, body.card-glass .toast, body.card-glass .palette {
+    background: color-mix(in srgb, var(--surface-2) 78%, transparent);
+    backdrop-filter: blur(26px) saturate(160%);
+  }
   body.card-outline .card { background: transparent; border-color: var(--border-strong); }
   body.card-elevated .card { border-color: transparent; box-shadow: var(--shadow); }
   body.hover-lift .card:hover { transform: translateY(-3px); box-shadow: var(--shadow); }
@@ -5982,10 +6101,246 @@ HTML_UI = r"""<!DOCTYPE html>
   .ai-pill .ai-orb .core { width: 18px; height: 18px; box-shadow: 0 0 14px var(--accent-glow); }
   .ai-pill .ai-orb .ring { inset: 3px; }
   #ai-pill-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* =================== Hintergrund-Bühne: Medien, Abdunklung, Muster, Live-Effekte =================== */
+  #bg-stage { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+  #bg-stage > * { position: absolute; inset: 0; }
+  #bg-media {
+    opacity: 0;
+    transform: scale(var(--bg-scale, 1));
+    transition: opacity calc(0.9s * var(--speed)) ease;
+  }
+  #bg-media.ready { opacity: var(--bg-opacity, 1); }
+  #bg-media video, #bg-media img {
+    width: 100%;
+    height: 100%;
+    object-fit: var(--bg-fit, cover);
+    display: block;
+    filter: blur(var(--bg-blur, 0px)) brightness(var(--bg-bright, 1)) saturate(var(--bg-sat, 1));
+  }
+  body.bg-kenburns #bg-media img { animation: kenburns calc(48s * var(--speed)) ease-in-out infinite alternate; }
+  @keyframes kenburns {
+    from { transform: scale(1.02) translate(0, 0); }
+    to { transform: scale(1.14) translate(-2.5%, -1.5%); }
+  }
+  #bg-dim { opacity: 0; transition: opacity calc(0.6s * var(--speed)) ease; background: color-mix(in srgb, var(--bg) var(--bg-dim, 45%), transparent); }
+  body.has-media #bg-dim { opacity: 1; }
+  body.has-media.bg-vignette #bg-dim {
+    background:
+      radial-gradient(ellipse 75% 70% at 50% 45%, transparent 45%, rgba(0, 0, 0, 0.55) 100%),
+      color-mix(in srgb, var(--bg) var(--bg-dim, 45%), transparent);
+  }
+  #bg-pattern { transition: opacity 0.4s ease; }
+
+  /* Mesh: große, weich verlaufende Farbflächen, die langsam wandern */
+  #bg-mesh { inset: -25%; opacity: 0; filter: blur(80px) saturate(130%); transition: opacity calc(1s * var(--speed)) ease; }
+  #bg-mesh.on { opacity: var(--mesh-alpha, 0.45); }
+  #bg-mesh i { position: absolute; width: 50vmax; height: 50vmax; border-radius: 50%; }
+  #bg-mesh i:nth-child(1) { background: var(--accent); left: 6%; top: 8%; animation: mesh-a calc(28s * var(--speed)) ease-in-out infinite alternate; }
+  #bg-mesh i:nth-child(2) { background: var(--accent-2); left: 52%; top: 30%; animation: mesh-b calc(34s * var(--speed)) ease-in-out infinite alternate; }
+  #bg-mesh i:nth-child(3) { background: color-mix(in srgb, var(--accent) 45%, var(--accent-2)); left: 18%; top: 58%; width: 42vmax; height: 42vmax; animation: mesh-c calc(39s * var(--speed)) ease-in-out infinite alternate; }
+  #bg-mesh i:nth-child(4) { background: color-mix(in srgb, var(--accent-2) 65%, #38bdf8); left: 64%; top: -6%; width: 36vmax; height: 36vmax; animation: mesh-d calc(31s * var(--speed)) ease-in-out infinite alternate; }
+  @keyframes mesh-a { to { transform: translate(16vmax, 10vmax) scale(1.18); } }
+  @keyframes mesh-b { to { transform: translate(-18vmax, 8vmax) scale(0.88); } }
+  @keyframes mesh-c { to { transform: translate(14vmax, -14vmax) scale(1.12); } }
+  @keyframes mesh-d { to { transform: translate(-10vmax, 16vmax) scale(1.25); } }
+  #bg-canvas { width: 100%; height: 100%; opacity: 0; transition: opacity calc(0.8s * var(--speed)) ease; }
+  #bg-canvas.on { opacity: 1; }
+
+  /* Über durchscheinenden Hintergründen wäre gedämpfter Text kaum lesbar: etwas anheben */
+  body.card-glass, body.has-media { --text-muted: color-mix(in srgb, var(--text-secondary) 78%, transparent); }
+
+  /* Willkommen über dem eigenen Hintergrund: Video scheint durch */
+  body.has-media .welcome { background: color-mix(in srgb, var(--bg) 52%, transparent); backdrop-filter: blur(24px) saturate(140%); }
+
+  /* =================== Effekte =================== */
+  body.border-glow .card { border-color: color-mix(in srgb, var(--accent) 26%, var(--border)); box-shadow: 0 0 26px -14px var(--accent); }
+  body.border-glow .card:hover {
+    border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+    box-shadow: 0 0 34px -8px var(--accent-glow), 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  body.border-glow .nav-btn.active { box-shadow: 0 0 20px -6px var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  body.border-glow .brand-mark { box-shadow: 0 0 18px var(--accent); }
+  body.btn-shine .btn-primary { position: relative; overflow: hidden; }
+  body.btn-shine .btn-primary::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -60%;
+    width: 38%;
+    height: 100%;
+    background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.45), transparent);
+    transform: skewX(-20deg);
+    animation: btn-shine calc(3.4s * var(--speed)) ease-in-out infinite;
+    pointer-events: none;
+  }
+  @keyframes btn-shine { 0%, 62% { left: -60%; } 100% { left: 130%; } }
+  body.text-shadow .card, body.text-shadow .sidebar, body.text-shadow .topbar { text-shadow: 0 1px 3px var(--text-shadow-color, rgba(0, 0, 0, 0.6)); }
+
+  /* =================== Schieberegler =================== */
+  .range-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 2px 10px; }
+  .range-row label { margin: 0; }
+  .range-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.68rem;
+    color: var(--text-primary);
+    background: var(--tint-2);
+    border: 1px solid var(--border);
+    padding: 1px 8px;
+    border-radius: 999px;
+    min-width: 54px;
+    text-align: center;
+  }
+  .range-row input { grid-column: 1 / -1; }
+  input[type="range"].nx-range { -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: transparent; cursor: pointer; margin: 0; }
+  input[type="range"].nx-range:focus { outline: none; }
+  input[type="range"].nx-range::-webkit-slider-runnable-track {
+    height: 5px;
+    border-radius: 99px;
+    background: var(--range-fill) 0 0 / var(--fill, 50%) 100% no-repeat, var(--track);
+  }
+  input[type="range"].nx-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    margin-top: -5.5px;
+    border-radius: 50%;
+    background: var(--knob);
+    border: 2px solid var(--accent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 16%, transparent), 0 2px 6px rgba(0, 0, 0, 0.35);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  input[type="range"].nx-range:hover::-webkit-slider-thumb { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 20%, transparent), 0 2px 6px rgba(0, 0, 0, 0.35); }
+  input[type="range"].nx-range:active::-webkit-slider-thumb { transform: scale(1.18); }
+
+  /* =================== Hintergrund-Bibliothek & Upload =================== */
+  .bg-drop {
+    border: 1.5px dashed var(--border-strong);
+    border-radius: calc(12px * var(--rs));
+    padding: 22px 18px;
+    text-align: center;
+    cursor: pointer;
+    background: var(--tint-1);
+    transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+  }
+  .bg-drop:hover { border-color: var(--accent); }
+  .bg-drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, transparent); transform: scale(1.01); }
+  .bg-drop-icon {
+    width: 42px;
+    height: 42px;
+    margin: 0 auto 10px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: var(--accent-fill);
+    color: var(--on-accent);
+    box-shadow: 0 6px 22px -6px var(--accent-glow);
+  }
+  .bg-drop b { display: block; font-size: 0.88rem; margin-bottom: 4px; }
+  .bg-drop span { font-size: 0.72rem; color: var(--text-secondary); }
+  .bg-lib { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-top: 14px; }
+  .bg-tile {
+    position: relative;
+    aspect-ratio: 16 / 10;
+    border-radius: calc(10px * var(--rs));
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--tint-2);
+    cursor: pointer;
+    transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  .bg-tile:hover { transform: translateY(-2px); border-color: var(--border-strong); }
+  .bg-tile.active { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent), 0 8px 26px -10px var(--accent-glow); }
+  .bg-tile video, .bg-tile img { width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none; }
+  .bg-meta {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 16px 8px 6px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.78));
+    color: #ffffff;
+    font-size: 0.66rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
+  }
+  .bg-meta span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bg-badge { font-family: 'JetBrains Mono', monospace; font-size: 0.56rem; padding: 1px 5px; border-radius: 4px; background: rgba(255, 255, 255, 0.2); flex-shrink: 0; }
+  .bg-del {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0, 0, 0, 0.6);
+    color: #ffffff;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .bg-tile:hover .bg-del { opacity: 1; }
+  .bg-tile.none { display: grid; place-items: center; text-align: center; font-size: 0.72rem; color: var(--text-secondary); padding: 8px; }
+
+  /* Live-Hintergründe als Kacheln mit Mini-Vorschau */
+  .fx-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .fx-tile {
+    border: 1px solid var(--border);
+    border-radius: calc(9px * var(--rs));
+    padding: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    font-size: 0.68rem;
+    cursor: pointer;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+  .fx-tile:hover { transform: translateY(-1px); border-color: var(--border-strong); }
+  .fx-tile.active { border-color: var(--accent); color: var(--text-primary); font-weight: 600; }
+  .fx-prev { height: 46px; border-radius: calc(6px * var(--rs)); margin-bottom: 5px; background-color: var(--bg); border: 1px solid var(--border); overflow: hidden; }
+  .fx-prev[data-fx="grid"] { background-image: linear-gradient(var(--tint-4) 1px, transparent 1px), linear-gradient(90deg, var(--tint-4) 1px, transparent 1px); background-size: 10px 10px; }
+  .fx-prev[data-fx="dots"] { background-image: radial-gradient(var(--tint-5) 1px, transparent 1.4px); background-size: 8px 8px; }
+  .fx-prev[data-fx="aurora"] { background-image: radial-gradient(60% 80% at 20% 20%, color-mix(in srgb, var(--accent) 45%, transparent), transparent 70%), radial-gradient(50% 70% at 85% 70%, color-mix(in srgb, var(--accent-2) 45%, transparent), transparent 70%); }
+  .fx-prev[data-fx="noise"] { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.35'/%3E%3C/svg%3E"); }
+  .fx-prev[data-fx="mesh"] { background-image: radial-gradient(45% 70% at 15% 30%, var(--accent), transparent 70%), radial-gradient(45% 70% at 70% 60%, var(--accent-2), transparent 70%), radial-gradient(40% 60% at 90% 0%, color-mix(in srgb, var(--accent-2) 60%, #38bdf8), transparent 70%); filter: saturate(120%); }
+  .fx-prev[data-fx="particles"] { background-image: radial-gradient(var(--accent) 1.2px, transparent 1.8px), linear-gradient(35deg, transparent 48%, color-mix(in srgb, var(--accent) 35%, transparent) 50%, transparent 52%); background-size: 14px 12px, 28px 24px; }
+  .fx-prev[data-fx="stars"] { background-color: #05060c; background-image: radial-gradient(#ffffff 0.8px, transparent 1.2px), radial-gradient(color-mix(in srgb, #ffffff 70%, var(--accent)) 0.6px, transparent 1px); background-size: 17px 13px, 11px 19px; background-position: 0 0, 5px 7px; }
+
+  /* Looks: komplette Designs mit einem Klick */
+  .look-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .look-tile {
+    border: 1px solid var(--border);
+    border-radius: calc(12px * var(--rs));
+    padding: 7px;
+    background: var(--tint-1);
+    cursor: pointer;
+    text-align: left;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  .look-tile:hover { transform: translateY(-2px); border-color: var(--border-strong); }
+  .look-tile.active { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+  .look-prev { height: 70px; border-radius: calc(8px * var(--rs)); position: relative; overflow: hidden; margin-bottom: 7px; padding: 8px; display: flex; gap: 6px; }
+  .look-prev i { flex: 1; border-radius: 5px; border: 1px solid rgba(255, 255, 255, 0.12); backdrop-filter: blur(6px); display: flex; flex-direction: column; justify-content: flex-end; padding: 5px; gap: 3px; }
+  .look-prev i::before, .look-prev i::after { content: ''; height: 4px; border-radius: 2px; background: var(--look-accent); }
+  .look-prev i::after { width: 60%; opacity: 0.5; }
+  .look-tile b { display: block; font-size: 0.78rem; }
+  .look-tile span { display: block; font-size: 0.64rem; color: var(--text-muted); margin-top: 1px; }
 </style>
 </head>
 <body>
 
+<div id="bg-stage" aria-hidden="true">
+  <div id="bg-media"></div>
+  <div id="bg-dim"></div>
+  <div id="bg-pattern"></div>
+  <div id="bg-mesh"><i></i><i></i><i></i><i></i></div>
+  <canvas id="bg-canvas"></canvas>
+</div>
 <div id="bg-fx"></div>
 <div class="progress-line" id="loader-bar"></div>
 
@@ -7090,6 +7445,8 @@ HTML_UI = r"""<!DOCTYPE html>
     <section class="view-panel" id="view-settings">
       <div class="settings-tabs" id="settings-tabs">
         <button data-tab="look" class="active">Aussehen</button>
+        <button data-tab="background">Hintergrund</button>
+        <button data-tab="effects">Glas & Effekte</button>
         <button data-tab="layout">Layout</button>
         <button data-tab="motion">Bewegung</button>
         <button data-tab="start">Start & Hinweise</button>
@@ -7097,6 +7454,11 @@ HTML_UI = r"""<!DOCTYPE html>
       </div>
 
       <!-- Tab: Aussehen -->
+      <div class="card" data-stab="look">
+        <div class="section-label"><span>Looks</span><span>EIN KLICK, KOMPLETTER STYLE</span></div>
+        <div class="look-grid" id="look-grid"></div>
+      </div>
+
       <div class="grid-2" data-stab="look">
         <div class="card">
           <div class="section-label"><span>Theme & Farbe</span><span>LOOK</span></div>
@@ -7120,14 +7482,105 @@ HTML_UI = r"""<!DOCTYPE html>
           <div class="section-label"><span>Oberfläche</span><span>SURFACE</span></div>
           <div class="stack" style="gap:10px;">
             <div><label>Kartenstil</label><div class="seg" data-key="card_style"></div></div>
-            <div><label>Hintergrund</label><div class="seg" data-key="pattern"></div></div>
             <div><label>Kontrast</label><div class="seg" data-key="contrast"></div></div>
             <div class="tweak-row">
               <div class="tweak-info"><h4>Glow & Maus-Licht</h4><p>Leuchtender Verlauf oben und Lichtkegel über den Karten</p></div>
               <label class="switch"><input type="checkbox" data-toggle="glow"><span class="slider"></span></label>
             </div>
           </div>
-          <div class="list-sub" style="white-space:normal; margin-top:10px;">Tipp: „Glas“ wirkt am besten mit dem Aurora-Hintergrund und Farbverlauf-Akzent.</div>
+          <div class="list-sub" style="white-space:normal; margin-top:10px;">Eigenes Video, Live-Hintergründe und Glas-Regler findest du in den Tabs „Hintergrund“ und „Glas & Effekte“.</div>
+        </div>
+      </div>
+
+      <!-- Tab: Hintergrund -->
+      <div class="card" data-stab="background">
+        <div class="section-label"><span>Eigener Hintergrund</span><span id="bg-count">0 / 30</span></div>
+        <div class="bg-drop" id="bg-drop" onclick="document.getElementById('bg-file').click()">
+          <div class="bg-drop-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"></path><path d="m6 10 6-6 6 6"></path><path d="M4 20h16"></path></svg>
+          </div>
+          <b id="bg-drop-title">Video, GIF oder Bild hier ablegen</b>
+          <span id="bg-drop-sub">oder klicken zum Auswählen · MP4, WebM, MOV, GIF, JPG, PNG, WebP · bis 1 GB · bleibt nur auf deinem PC</span>
+          <div class="bar-track" id="bg-upload-track" style="display:none; margin:12px auto 0; max-width:320px;"><div class="bar-fill" id="bg-upload-bar"></div></div>
+        </div>
+        <input type="file" id="bg-file" accept="video/mp4,video/webm,video/quicktime,.mov,.m4v,image/gif,image/jpeg,image/png,image/webp,image/avif" style="display:none;" onchange="if (this.files[0]) uploadBackground(this.files[0]); this.value = '';">
+        <div class="bg-lib" id="bg-lib"></div>
+      </div>
+
+      <div class="grid-2" data-stab="background">
+        <div class="card">
+          <div class="section-label"><span>Hintergrund anpassen</span><span>MEDIA</span></div>
+          <div class="stack" style="gap:12px;">
+            <div class="range-row"><label>Deckkraft</label><span class="range-val" data-range-val="bg_opacity"></span><input type="range" class="nx-range" data-range="bg_opacity" min="0" max="100"></div>
+            <div class="range-row"><label>Unschärfe</label><span class="range-val" data-range-val="bg_blur"></span><input type="range" class="nx-range" data-range="bg_blur" min="0" max="40"></div>
+            <div class="range-row"><label>Abdunkeln (Lesbarkeit)</label><span class="range-val" data-range-val="bg_dim"></span><input type="range" class="nx-range" data-range="bg_dim" min="0" max="95"></div>
+            <div class="grid-2" style="gap:12px;">
+              <div class="range-row"><label>Helligkeit</label><span class="range-val" data-range-val="bg_brightness"></span><input type="range" class="nx-range" data-range="bg_brightness" min="40" max="160"></div>
+              <div class="range-row"><label>Sättigung</label><span class="range-val" data-range-val="bg_saturation"></span><input type="range" class="nx-range" data-range="bg_saturation" min="0" max="200"></div>
+            </div>
+            <div class="grid-2" style="gap:12px; align-items:end;">
+              <div><label>Darstellung</label><div class="seg" data-key="bg_fit"></div></div>
+              <div class="range-row"><label>Video-Tempo</label><span class="range-val" data-range-val="bg_speed"></span><input type="range" class="nx-range" data-range="bg_speed" min="25" max="200" step="5"></div>
+            </div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>Vignette</h4><p>Dunkle Ränder lenken den Blick in die Mitte</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="bg_vignette"><span class="slider"></span></label>
+            </div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>Kamerafahrt bei Bildern</h4><p>Langsamer Zoom, damit Standbilder lebendig wirken</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="bg_kenburns"><span class="slider"></span></label>
+            </div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>Video pausieren, wenn NEXUS im Hintergrund ist</h4><p>Spart Strom und Grafikleistung</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="bg_pause_hidden"><span class="slider"></span></label>
+            </div>
+            <button class="btn-secondary" id="bg-accent-btn" onclick="accentFromBackground()">Akzentfarben aus dem Hintergrund übernehmen</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="section-label"><span>Live-Hintergrund</span><span>ANIMIERT</span></div>
+          <div class="fx-grid" id="fx-grid"></div>
+          <div class="list-sub" style="white-space:normal; margin-top:12px;">Live-Hintergründe liegen über deinem eigenen Video oder Bild – z.B. Partikel über einem dunklen Clip. Farben kommen aus deinem Akzent.</div>
+        </div>
+      </div>
+
+      <!-- Tab: Glas & Effekte -->
+      <div class="grid-2" data-stab="effects">
+        <div class="card">
+          <div class="section-label"><span>Glas</span><span>GLASSMORPHISM</span></div>
+          <div class="stack" style="gap:12px;">
+            <div><label>Kartenstil</label><div class="seg" data-key="card_style"></div></div>
+            <div class="range-row"><label>Glas-Deckkraft</label><span class="range-val" data-range-val="glass_opacity"></span><input type="range" class="nx-range" data-range="glass_opacity" min="5" max="100"></div>
+            <div class="range-row"><label>Glas-Unschärfe</label><span class="range-val" data-range-val="glass_blur"></span><input type="range" class="nx-range" data-range="glass_blur" min="0" max="40"></div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>Lesbarkeits-Schatten</h4><p>Weicher Schatten unter Text – hilft über hellen Videos</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="text_shadow"><span class="slider"></span></label>
+            </div>
+          </div>
+          <div class="list-sub" style="white-space:normal; margin-top:10px;">Deckkraft und Unschärfe wirken beim Kartenstil „Glas“ auf Karten, Seitenleiste, Kopfzeile, Dialoge und Hinweise.</div>
+        </div>
+
+        <div class="card">
+          <div class="section-label"><span>Licht & Effekte</span><span>FX</span></div>
+          <div class="stack" style="gap:12px;">
+            <div class="range-row"><label>Leucht-Intensität</label><span class="range-val" data-range-val="glow_strength"></span><input type="range" class="nx-range" data-range="glow_strength" min="0" max="200" step="5"></div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>Neon-Rahmen</h4><p>Karten und aktive Navigation leuchten in deiner Akzentfarbe</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="border_glow"><span class="slider"></span></label>
+            </div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>Glanz auf Buttons</h4><p>Ein Lichtstreifen läuft über die Haupt-Buttons</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="btn_shine"><span class="slider"></span></label>
+            </div>
+            <div class="range-row"><label>Größe der Oberfläche</label><span class="range-val" data-range-val="ui_scale"></span><input type="range" class="nx-range" data-range="ui_scale" min="80" max="125" step="5"></div>
+            <div class="preview-box">
+              <button class="btn-primary">Primär</button>
+              <button class="btn-secondary">Sekundär</button>
+              <label class="switch"><input type="checkbox" checked><span class="slider"></span></label>
+              <div class="bar-track" style="flex:1; min-width:90px; margin:0;"><div class="bar-fill" style="width:62%;"></div></div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -8348,6 +8801,7 @@ async function loadUserData(withNotes = false) {
   renderCommands();
   settings = userData.settings;
   applySettings();
+  renderBgLibrary();
   setText('set-data-path', `Gespeichert in ${userData.data_file}`);
   if (withNotes) document.getElementById('notes').value = userData.notes;
 }
@@ -8880,7 +9334,10 @@ const DEFAULT_DESIGN = {
   radius: 'normal', density: 'normal', pattern: 'none', glow: true, animations: true, show_console: true,
   nav_numbers: true, card_style: 'solid', contrast: 'normal', button_shape: 'normal', sidebar_side: 'left',
   sidebar_width: 'normal', label_case: 'upper', mono_values: true, scrollbar: 'normal', transition: 'pop',
-  motion_speed: 'normal', hover_lift: false
+  motion_speed: 'normal', hover_lift: false,
+  glass_opacity: 60, glass_blur: 18, glow_strength: 100, ui_scale: 100, border_glow: false, text_shadow: false,
+  btn_shine: false, bg_opacity: 100, bg_blur: 0, bg_dim: 45, bg_brightness: 100, bg_saturation: 100, bg_speed: 100,
+  bg_fit: 'cover', bg_vignette: true, bg_kenburns: true
 };
 const DESIGN_KEYS = Object.keys(DEFAULT_DESIGN);
 let settings = {
@@ -8889,7 +9346,8 @@ let settings = {
   welcome: true, welcome_style: 'stats', welcome_duration: 2500, welcome_name: '',
   toasts: 'all', toast_pos: 'bottom-right', toast_duration: 5, clock_format: '24', clock_seconds: true,
   browser: 'brave', ai_listen: false, ai_voice: true, ai_voice_name: '', ai_voice_style: 'cozy', ai_sound: 'soft',
-  ai_sensitivity: 'normal', ai_llm: true, ai_model: 'qwen2.5:3b', ai_web_fallback: true
+  ai_sensitivity: 'normal', ai_llm: true, ai_model: 'qwen2.5:3b', ai_web_fallback: true,
+  bg_media: '', bg_pause_hidden: true
 };
 const ACCENTS = ['#ffffff', '#3b82f6', '#a855f7', '#10b981', '#f59e0b', '#ef4444'];
 
@@ -8913,7 +9371,9 @@ const SEGMENTS = {
   font_size: [[14, 'XS'], [15, 'S'], [16, 'M'], [17, 'L'], [18, 'XL']],
   radius: [['sharp', 'Eckig'], ['normal', 'Normal'], ['round', 'Rund']],
   density: [['compact', 'Kompakt'], ['normal', 'Normal'], ['cozy', 'Luftig']],
-  pattern: [['none', 'Schlicht'], ['grid', 'Raster'], ['dots', 'Punkte'], ['aurora', 'Aurora'], ['noise', 'Körnung']],
+  pattern: [['none', 'Schlicht'], ['mesh', 'Mesh'], ['aurora', 'Aurora'], ['particles', 'Partikel'], ['stars', 'Sterne'],
+    ['grid', 'Raster'], ['dots', 'Punkte'], ['noise', 'Körnung']],
+  bg_fit: [['cover', 'Füllen'], ['contain', 'Ganz zeigen']],
   card_style: [['solid', 'Solid'], ['glass', 'Glas'], ['outline', 'Outline'], ['elevated', 'Schwebend']],
   contrast: [['normal', 'Normal'], ['high', 'Hoch']],
   button_shape: [['normal', 'Normal'], ['pill', 'Pill']],
@@ -8972,6 +9432,38 @@ function initSettingsUI() {
     input.addEventListener('change', () => saveSetting({ [input.dataset.toggle]: input.checked }));
   });
 
+  // Schieberegler: beim Ziehen sofort live sehen, beim Loslassen speichern
+  document.querySelectorAll('input[data-range]').forEach(input => {
+    const key = input.dataset.range;
+    input.addEventListener('input', () => {
+      settings[key] = +input.value;
+      paintRange(input);
+      if (key !== 'ui_scale') {  // Größe erst beim Loslassen, sonst springt der Regler unter der Maus weg
+        applyUi();
+        applyAccent(settings.accent);
+        applyBackground();
+      }
+    });
+    input.addEventListener('change', () => {
+      const patch = { [key]: +input.value };
+      // Glas-Regler wirken nur auf Glas-Karten: dann gleich dorthin wechseln
+      if (key.startsWith('glass_') && settings.card_style !== 'glass') patch.card_style = 'glass';
+      saveSetting(patch);
+    });
+  });
+
+  const fxGrid = document.getElementById('fx-grid');
+  SEGMENTS.pattern.forEach(([value, label]) => {
+    const tile = document.createElement('button');
+    tile.className = 'fx-tile';
+    tile.dataset.value = value;
+    tile.innerHTML = `<div class="fx-prev" data-fx="${value}"></div>${label}`;
+    tile.addEventListener('click', () => saveSetting({ pattern: value }));
+    fxGrid.appendChild(tile);
+  });
+  renderLooks();
+  initBackgroundDrop();
+
   const modules = document.getElementById('set-modules');
   document.querySelectorAll('.nav-btn').forEach(btn => {
     const id = viewIdOf(btn);
@@ -9020,8 +9512,8 @@ function hexRgb(hex) {
 }
 
 function glowFor(hex, light) {
-  const alpha = light ? 0.1 : (hex === '#ffffff' ? 0.14 : 0.22);
-  return `rgba(${hexRgb(hex).join(', ')}, ${alpha})`;
+  const alpha = (light ? 0.1 : (hex === '#ffffff' ? 0.14 : 0.22)) * (settings.glow_strength ?? 100) / 100;
+  return `rgba(${hexRgb(hex).join(', ')}, ${Math.min(alpha, 0.6).toFixed(3)})`;
 }
 
 // Textfarbe auf Akzent-Flächen: Schwarz oder Weiß, je nachdem was mehr WCAG-Kontrast ergibt
@@ -9049,6 +9541,8 @@ function applyAccent(hex) {
   root.setProperty('--accent-fill', fill);
   root.setProperty('--name-fill', gradient ? fill : `linear-gradient(135deg, var(--text-primary) 15%, ${effective})`);
   root.setProperty('--accent-glow', glowFor(effective, theme.light));
+  root.setProperty('--range-fill', gradient ? `linear-gradient(90deg, ${effective}, ${settings.accent2})` : `linear-gradient(${effective}, ${effective})`);
+  BgCanvas.colors(effective, settings.accent2);
   // Bei Verlauf die Textfarbe an der Mischfarbe beider Enden ausrichten
   root.setProperty('--on-accent', onAccentFor(gradient ? mixHex(effective, settings.accent2) : effective));
   document.getElementById('set-accent').value = hex;
@@ -9073,6 +9567,7 @@ function applyUi() {
     : { b: 0.08, s: 0.2, t1: 0.018, t2: 0.035, t3: 0.065, t4: 0.12, t5: 0.25, spot: 0.045, pat: 0.035 };
   const high = settings.contrast === 'high';
   if (high) ['b', 's', 't1', 't2', 't3'].forEach(key => k[key] *= 1.7);
+  k.spot *= (settings.glow_strength ?? 100) / 100;
   const tint = a => `rgba(${t.tint}, ${Math.min(a, 0.6)})`;
   // Hoher Kontrast: Sekundärtext näher an die Hauptfarbe, gedämpfter Text bekommt die alte Sekundärfarbe
   const text2 = high ? `color-mix(in srgb, ${t.text[0]} 75%, ${t.text[1]})` : t.text[1];
@@ -9115,7 +9610,11 @@ function applyUi() {
   body.classList.toggle('scroll-hidden', settings.scrollbar === 'hidden');
   body.classList.toggle('hover-lift', settings.hover_lift);
   document.getElementById('bg-fx').className = ['aurora', 'noise'].includes(settings.pattern) ? settings.pattern : '';
+  document.getElementById('bg-mesh').classList.toggle('on', settings.pattern === 'mesh');
+  root.setProperty('--mesh-alpha', t.light ? 0.28 : 0.42);
+  BgCanvas.set(['particles', 'stars'].includes(settings.pattern) ? settings.pattern : null);
   document.getElementById('toast-stack').className = `toast-stack ${settings.toast_pos}`;
+  // Glow, Raster und Punkte liegen auf einer eigenen Ebene über dem eigenen Hintergrund (nicht mehr auf body)
   const layers = [];
   if (settings.glow) layers.push(['radial-gradient(ellipse 80% 45% at 50% -15%, var(--accent-glow), transparent)', 'auto']);
   if (settings.pattern === 'grid') {
@@ -9124,8 +9623,21 @@ function applyUi() {
   } else if (settings.pattern === 'dots') {
     layers.push(['radial-gradient(var(--tint-4) 1px, transparent 1.6px)', '20px 20px']);
   }
-  body.style.backgroundImage = layers.map(l => l[0]).join(', ') || 'none';
-  body.style.backgroundSize = layers.map(l => l[1]).join(', ') || 'auto';
+  const patternLayer = document.getElementById('bg-pattern').style;
+  patternLayer.backgroundImage = layers.map(l => l[0]).join(', ') || 'none';
+  patternLayer.backgroundSize = layers.map(l => l[1]).join(', ') || 'auto';
+  body.style.backgroundImage = 'none';
+
+  // Glas, Effekte & Größe
+  root.setProperty('--glass-alpha', `${settings.glass_opacity}%`);
+  root.setProperty('--glass-blur', `${settings.glass_blur}px`);
+  root.setProperty('--text-shadow-color', t.light ? 'rgba(255, 255, 255, 0.7)' : 'rgba(0, 0, 0, 0.6)');
+  body.classList.toggle('border-glow', settings.border_glow);
+  body.classList.toggle('btn-shine', settings.btn_shine);
+  body.classList.toggle('text-shadow', settings.text_shadow);
+  const scale = (settings.ui_scale || 100) / 100;
+  document.documentElement.style.zoom = scale === 1 ? '' : scale;
+  body.style.height = scale === 1 ? '' : `calc(100vh / ${scale})`;
 
   document.querySelector('.brand-name').textContent = settings.brand_name;
   document.querySelector('.version-pill').textContent = settings.brand_tag;
@@ -9150,6 +9662,12 @@ function syncSettingsControls() {
     seg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.value === String(settings[seg.dataset.key])));
   });
   document.querySelectorAll('[data-toggle]').forEach(input => input.checked = !!settings[input.dataset.toggle]);
+  document.querySelectorAll('input[data-range]').forEach(input => {
+    if (document.activeElement !== input) input.value = settings[input.dataset.range];
+    paintRange(input);
+  });
+  document.querySelectorAll('.fx-tile').forEach(tile => tile.classList.toggle('active', tile.dataset.value === settings.pattern));
+  syncLooks();
   document.querySelectorAll('#set-modules input').forEach(i => i.checked = !settings.hidden_views.includes(i.value));
   document.querySelectorAll('#set-dash-sections input').forEach(i => i.checked = !settings.dash_hidden.includes(i.value));
   const brand = document.getElementById('set-brand');
@@ -9168,6 +9686,7 @@ function syncSettingsControls() {
 function applySettings() {
   applyUi();
   applyAccent(settings.accent);
+  applyBackground();
   TactileAudio.enabled = settings.sound;
   document.getElementById('audio-toggle').innerText = `Sound: ${settings.sound ? 'On' : 'Off'}`;
   syncSettingsControls();
@@ -9218,6 +9737,453 @@ function fmtClock(date, withSeconds = settings.clock_seconds) {
   const h12 = settings.clock_format === '12';
   return date.toLocaleTimeString(h12 ? 'en-US' : 'de-DE',
     { hour: '2-digit', minute: '2-digit', second: withSeconds ? '2-digit' : undefined, hour12: h12 });
+}
+
+// ---------------- Schieberegler ----------------
+const RANGE_FORMAT = {
+  bg_opacity: v => `${v} %`, bg_blur: v => `${v} px`, bg_dim: v => `${v} %`, bg_brightness: v => `${v} %`,
+  bg_saturation: v => `${v} %`, bg_speed: v => `${(v / 100).toLocaleString('de-DE', { maximumFractionDigits: 2 })}×`,
+  glass_opacity: v => `${v} %`, glass_blur: v => `${v} px`, glow_strength: v => `${v} %`, ui_scale: v => `${v} %`,
+};
+
+function paintRange(input) {
+  const min = +input.min, max = +input.max, value = +input.value;
+  input.style.setProperty('--fill', `${((value - min) / (max - min)) * 100}%`);
+  const label = document.querySelector(`[data-range-val="${input.dataset.range}"]`);
+  if (label) label.textContent = (RANGE_FORMAT[input.dataset.range] || String)(value);
+}
+
+// ---------------- Eigener Hintergrund: Video, GIF oder Bild ----------------
+const BG_EXTS = ['.mp4', '.m4v', '.mov', '.webm', '.gif', '.jpg', '.jpeg', '.png', '.webp', '.avif'];
+const BG_DROP_TEXT = ['Video, GIF oder Bild hier ablegen', 'oder klicken zum Auswählen · MP4, WebM, MOV, GIF, JPG, PNG, WebP · bis 1 GB · bleibt nur auf deinem PC'];
+// <video>/<img> können keinen Header schicken, deshalb steht der Token in der URL (nur dieses Fenster kennt ihn)
+const bgUrl = entry => `/bg/${entry.id}?t=${encodeURIComponent(NEXUS_TOKEN)}`;
+
+function applyBackground() {
+  const entry = ((userData && userData.backgrounds) || []).find(b => b.id === settings.bg_media);
+  const box = document.getElementById('bg-media');
+  const id = entry ? entry.id : '';
+  if (box.dataset.id !== id) {
+    box.dataset.id = id;
+    box.classList.remove('ready');
+    // Altes Medium erst ausblenden, dann entfernen (Video sauber stoppen, sonst lädt es weiter)
+    const old = [...box.children];
+    setTimeout(() => old.forEach(el => {
+      if (el.tagName === 'VIDEO') { el.pause(); el.removeAttribute('src'); el.load(); }
+      el.remove();
+    }), 500);
+    if (entry) {
+      const el = document.createElement(entry.kind === 'video' ? 'video' : 'img');
+      if (entry.kind === 'video') {
+        Object.assign(el, { muted: true, loop: true, autoplay: true, playsInline: true });
+        el.addEventListener('loadeddata', () => {
+          el.playbackRate = settings.bg_speed / 100;
+          box.classList.add('ready');
+        });
+      } else {
+        el.addEventListener('load', () => box.classList.add('ready'));
+      }
+      el.src = bgUrl(entry);
+      box.appendChild(el);
+    }
+  }
+  const root = document.documentElement.style;
+  root.setProperty('--bg-opacity', settings.bg_opacity / 100);
+  root.setProperty('--bg-blur', `${settings.bg_blur}px`);
+  root.setProperty('--bg-scale', 1 + settings.bg_blur / 200);  // leicht vergrößern, damit unscharfe Ränder nicht zu sehen sind
+  root.setProperty('--bg-dim', `${settings.bg_dim}%`);
+  root.setProperty('--bg-bright', settings.bg_brightness / 100);
+  root.setProperty('--bg-sat', settings.bg_saturation / 100);
+  root.setProperty('--bg-fit', settings.bg_fit);
+  document.body.classList.toggle('has-media', !!entry);
+  document.body.classList.toggle('bg-vignette', !!settings.bg_vignette);
+  document.body.classList.toggle('bg-kenburns', !!settings.bg_kenburns && settings.animations);
+  const video = box.querySelector('video');
+  if (video) video.playbackRate = settings.bg_speed / 100;
+  document.querySelectorAll('.bg-tile').forEach(t => t.classList.toggle('active', t.dataset.id === (settings.bg_media || '')));
+}
+
+document.addEventListener('visibilitychange', () => {
+  const video = document.querySelector('#bg-media video');
+  if (!video) return;
+  if (document.hidden && settings.bg_pause_hidden) video.pause();
+  else video.play().catch(() => {});
+});
+
+function renderBgLibrary() {
+  const items = (userData && userData.backgrounds) || [];
+  setText('bg-count', `${items.length} / 30`);
+  const lib = document.getElementById('bg-lib');
+  lib.innerHTML = '';
+  const none = document.createElement('button');
+  none.className = 'bg-tile none';
+  none.dataset.id = '';
+  none.innerHTML = '<div>Kein eigener<br>Hintergrund</div>';
+  none.addEventListener('click', () => selectBackground(''));
+  lib.appendChild(none);
+  items.slice().reverse().forEach(b => {
+    const tile = document.createElement('div');
+    tile.className = 'bg-tile';
+    tile.dataset.id = b.id;
+    tile.title = b.name;
+    const media = document.createElement(b.kind === 'video' ? 'video' : 'img');
+    if (b.kind === 'video') {
+      Object.assign(media, { muted: true, loop: true, preload: 'metadata', playsInline: true });
+      media.src = `${bgUrl(b)}#t=0.5`;
+      // Vorschau spielt beim Drüberfahren
+      tile.addEventListener('mouseenter', () => media.play().catch(() => {}));
+      tile.addEventListener('mouseleave', () => media.pause());
+    } else {
+      media.loading = 'lazy';
+      media.src = bgUrl(b);
+    }
+    const badge = b.kind === 'video' ? 'VIDEO' : b.ext === '.gif' ? 'GIF' : 'BILD';
+    const meta = document.createElement('div');
+    meta.className = 'bg-meta';
+    meta.innerHTML = `<span>${esc(b.name)}</span><span class="bg-badge">${badge} · ${fmtBytes(b.size)}</span>`;
+    const del = document.createElement('button');
+    del.className = 'bg-del';
+    del.title = 'Löschen';
+    del.textContent = '×';
+    del.addEventListener('click', (e) => { e.stopPropagation(); deleteBackground(b); });
+    tile.append(media, meta, del);
+    tile.addEventListener('click', () => selectBackground(b.id));
+    lib.appendChild(tile);
+  });
+  applyBackground();
+}
+
+async function selectBackground(id) {
+  const patch = { bg_media: id };
+  // Volle Karten würden das Video verdecken: beim ersten eigenen Hintergrund auf Glas umstellen
+  if (id && settings.card_style === 'solid') patch.card_style = 'glass';
+  await saveSetting(patch);
+}
+
+async function deleteBackground(b) {
+  if (!await nexusConfirm(`„${b.name}“ wird aus NEXUS gelöscht. Die Originaldatei auf deinem PC bleibt.`,
+    { title: 'Hintergrund löschen?', confirm: 'Löschen', danger: true })) return;
+  const res = await api('/api/bg_delete', { id: b.id });
+  userData.backgrounds = res.backgrounds;
+  settings = res.settings;
+  applySettings();
+  renderBgLibrary();
+  log(`Hintergrund „${b.name}“ gelöscht.`, true);
+}
+
+function uploadBackground(file) {
+  const ext = ((file.name.match(/\.[^.]+$/) || [''])[0]).toLowerCase();
+  if (!BG_EXTS.includes(ext)) {
+    log('Dieses Format geht nicht. Nimm ein Video (MP4, WebM, MOV), ein GIF oder ein Bild (JPG, PNG, WebP).', 'error');
+    return;
+  }
+  if (file.size > 1024 ** 3) {
+    log('Die Datei ist größer als 1 GB.', 'error');
+    return;
+  }
+  const track = document.getElementById('bg-upload-track');
+  const bar = document.getElementById('bg-upload-bar');
+  track.style.display = '';
+  bar.style.width = '0%';
+  setText('bg-drop-title', `„${file.name}“ wird hochgeladen …`);
+  const finish = () => {
+    track.style.display = 'none';
+    setText('bg-drop-title', BG_DROP_TEXT[0]);
+    setText('bg-drop-sub', BG_DROP_TEXT[1]);
+  };
+  // XMLHttpRequest statt fetch: nur so gibt es einen Fortschrittsbalken beim Hochladen
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/bg_upload');
+  xhr.setRequestHeader('X-Nexus-Token', NEXUS_TOKEN);
+  xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.upload.onprogress = (e) => {
+    if (!e.lengthComputable) return;
+    bar.style.width = `${(e.loaded / e.total) * 100}%`;
+    setText('bg-drop-sub', `${Math.round((e.loaded / e.total) * 100)} % · ${fmtBytes(e.loaded)} von ${fmtBytes(e.total)}`);
+  };
+  xhr.onload = async () => {
+    finish();
+    let res = {};
+    try { res = JSON.parse(xhr.responseText); } catch (e) {}
+    if (xhr.status !== 200) {
+      log(res.error || `Upload fehlgeschlagen (HTTP ${xhr.status})`, 'error');
+      return;
+    }
+    userData.backgrounds = res.backgrounds;
+    renderBgLibrary();
+    await selectBackground(res.id);
+    TactileAudio.done();
+    log(`Neuer Hintergrund: ${file.name}`, true);
+  };
+  xhr.onerror = () => {
+    finish();
+    log('Upload fehlgeschlagen.', 'error');
+  };
+  xhr.send(file);
+}
+
+function initBackgroundDrop() {
+  const drop = document.getElementById('bg-drop');
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', (e) => {
+    const file = e.dataTransfer.files[0];
+    if (file) uploadBackground(file);
+  });
+  // Daneben fallengelassene Dateien nicht im App-Fenster öffnen
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => e.preventDefault());
+}
+
+// Akzentfarben aus dem aktuellen Video-Bild bzw. Bild ziehen: die zwei kräftigsten Farbtöne gewinnen
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  const h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h / 6, s, l];
+}
+
+function hslToHex(h, s, l) {
+  const f = (n) => {
+    const k = (n + h * 12) % 12;
+    const c = l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(c * 255).toString(16).padStart(2, '0');
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+
+async function accentFromBackground() {
+  const media = document.querySelector('#bg-media video, #bg-media img');
+  if (!media) {
+    log('Wähle zuerst einen eigenen Hintergrund aus.', 'error');
+    return;
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 36;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(media, 0, 0, 64, 36);
+  const px = ctx.getImageData(0, 0, 64, 36).data;
+  const bins = Array.from({ length: 18 }, () => ({ w: 0, h: 0, s: 0, l: 0 }));
+  for (let i = 0; i < px.length; i += 4) {
+    const [h, s, l] = rgbToHsl(px[i], px[i + 1], px[i + 2]);
+    if (s < 0.22 || l < 0.15 || l > 0.88) continue;
+    const w = s * (1 - Math.abs(l - 0.55));
+    const bin = bins[Math.floor(h * 18) % 18];
+    bin.w += w; bin.h += h * w; bin.s += s * w; bin.l += l * w;
+  }
+  const ranked = bins.map((b, i) => ({ ...b, i })).filter(b => b.w > 0).sort((a, b) => b.w - a.w);
+  if (!ranked.length) {
+    log('Der Hintergrund ist zu farblos – such dir die Akzentfarbe lieber selbst aus.', 'error');
+    return;
+  }
+  const vivid = (b) => hslToHex(b.h / b.w, Math.max(b.s / b.w, 0.6), Math.min(Math.max(b.l / b.w, 0.5), 0.66));
+  const first = ranked[0];
+  const second = ranked.find(b => Math.min(Math.abs(b.i - first.i), 18 - Math.abs(b.i - first.i)) >= 3);
+  const accent = vivid(first);
+  const accent2 = second ? vivid(second) : hslToHex(((first.h / first.w) + 0.12) % 1, 0.7, 0.6);
+  await saveSetting({ accent, accent2, accent_gradient: true });
+  TactileAudio.done();
+  log(`Akzentfarben aus dem Hintergrund: ${accent} → ${accent2}`, true);
+}
+
+// ---------------- Live-Hintergründe auf Canvas: Partikel & Sterne ----------------
+const BgCanvas = {
+  mode: null, raf: 0, items: [], w: 0, h: 0, last: 0, rgb: [255, 255, 255], rgb2: [168, 85, 247],
+  mouse: { x: -1e4, y: -1e4 }, meteor: null, nextMeteor: 0,
+
+  set(mode) {
+    const canvas = document.getElementById('bg-canvas');
+    const changed = mode !== this.mode;
+    this.mode = mode;
+    canvas.classList.toggle('on', !!mode);
+    cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    if (!mode) return;
+    if (changed || !this.items.length) {
+      this.resize();
+      this.seed();
+    }
+    this.start();
+  },
+
+  colors(accent, accent2) {
+    this.rgb = hexRgb(accent);
+    this.rgb2 = hexRgb(accent2);
+  },
+
+  resize() {
+    const canvas = document.getElementById('bg-canvas');
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.w = canvas.clientWidth || window.innerWidth;
+    this.h = canvas.clientHeight || window.innerHeight;
+    canvas.width = this.w * dpr;
+    canvas.height = this.h * dpr;
+    this.ctx = canvas.getContext('2d');
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  },
+
+  seed() {
+    const area = this.w * this.h;
+    const rnd = (a, b) => a + Math.random() * (b - a);
+    if (this.mode === 'particles') {
+      const n = Math.max(40, Math.min(110, Math.round(area / 15000)));
+      this.items = Array.from({ length: n }, () => ({
+        x: rnd(0, this.w), y: rnd(0, this.h), vx: rnd(-0.25, 0.25), vy: rnd(-0.25, 0.25), r: rnd(1, 2.3), c: Math.random() < 0.3,
+      }));
+    } else {
+      const n = Math.round(area / 1700);
+      this.items = Array.from({ length: n }, () => ({
+        x: rnd(0, this.w), y: rnd(0, this.h), z: Math.random() ** 2, ph: rnd(0, Math.PI * 2), sp: rnd(0.0008, 0.0025), c: Math.random() < 0.12,
+      }));
+      this.nextMeteor = performance.now() + rnd(3000, 7000);
+    }
+  },
+
+  start() {
+    if (!settings.animations) {  // ohne Animationen ein ruhiges Standbild
+      this.draw(performance.now(), 0);
+      return;
+    }
+    this.last = performance.now();
+    const loop = (ts) => {
+      this.raf = requestAnimationFrame(loop);
+      if (document.hidden) return;
+      const dt = Math.min((ts - this.last) / 16.67, 3) / (speedFactor() || 1);
+      this.last = ts;
+      this.draw(ts, dt);
+    };
+    this.raf = requestAnimationFrame(loop);
+  },
+
+  draw(ts, dt) {
+    const { ctx, w, h } = this;
+    ctx.clearRect(0, 0, w, h);
+    const light = (THEMES[settings.theme] || {}).light;
+    const rgba = (c, a) => `rgba(${c.join(',')},${a.toFixed(3)})`;
+    if (this.mode === 'particles') {
+      const pts = this.items;
+      for (const p of pts) {
+        // sanft vom Mauszeiger wegdrücken
+        const mx = p.x - this.mouse.x, my = p.y - this.mouse.y, md = mx * mx + my * my;
+        if (md < 120 * 120 && md > 1) { p.vx += (mx / Math.sqrt(md)) * 0.02; p.vy += (my / Math.sqrt(md)) * 0.02; }
+        p.vx = Math.max(-0.6, Math.min(0.6, p.vx * 0.995 + (Math.random() - 0.5) * 0.01));
+        p.vy = Math.max(-0.6, Math.min(0.6, p.vy * 0.995 + (Math.random() - 0.5) * 0.01));
+        p.x = (p.x + p.vx * dt + w) % w;
+        p.y = (p.y + p.vy * dt + h) % h;
+      }
+      const max = 140;
+      ctx.lineWidth = 1;
+      for (let i = 0; i < pts.length; i++) {
+        for (let j = i + 1; j < pts.length; j++) {
+          const dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y, d2 = dx * dx + dy * dy;
+          if (d2 > max * max) continue;
+          ctx.strokeStyle = rgba(this.rgb, (1 - Math.sqrt(d2) / max) * (light ? 0.18 : 0.22));
+          ctx.beginPath(); ctx.moveTo(pts[i].x, pts[i].y); ctx.lineTo(pts[j].x, pts[j].y); ctx.stroke();
+        }
+        const dx = pts[i].x - this.mouse.x, dy = pts[i].y - this.mouse.y, d = Math.sqrt(dx * dx + dy * dy);
+        if (d < 180) {
+          ctx.strokeStyle = rgba(this.rgb2, (1 - d / 180) * 0.35);
+          ctx.beginPath(); ctx.moveTo(pts[i].x, pts[i].y); ctx.lineTo(this.mouse.x, this.mouse.y); ctx.stroke();
+        }
+      }
+      for (const p of pts) {
+        ctx.fillStyle = rgba(p.c ? this.rgb2 : this.rgb, 0.8);
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+      }
+    } else {
+      const base = light ? [24, 24, 27] : [255, 255, 255];
+      for (const s of this.items) {
+        s.x -= (0.04 + s.z * 0.22) * dt;
+        if (s.x < -2) { s.x = w + 2; s.y = Math.random() * h; }
+        const tw = 0.55 + 0.45 * Math.sin(ts * s.sp + s.ph);
+        ctx.fillStyle = rgba(s.c ? this.rgb : base, tw * (0.25 + s.z * 0.7));
+        const r = 0.4 + s.z * 1.4;
+        ctx.fillRect(s.x - r / 2, s.y - r / 2, r, r);
+      }
+      // ab und zu eine Sternschnuppe
+      if (dt && !this.meteor && ts > this.nextMeteor) {
+        this.meteor = { x: Math.random() * w * 0.7 + w * 0.3, y: Math.random() * h * 0.3, t: 0 };
+      }
+      if (this.meteor) {
+        const m = this.meteor;
+        m.t += 0.018 * dt;
+        const x = m.x - m.t * 420, y = m.y + m.t * 210, alpha = Math.sin(Math.min(m.t, 1) * Math.PI);
+        const grad = ctx.createLinearGradient(x, y, x + 110, y - 55);
+        grad.addColorStop(0, rgba(base, alpha * 0.9));
+        grad.addColorStop(1, rgba(base, 0));
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 110, y - 55); ctx.stroke();
+        if (m.t >= 1) {
+          this.meteor = null;
+          this.nextMeteor = ts + 5000 + Math.random() * 9000;
+        }
+      }
+    }
+  },
+};
+
+window.addEventListener('resize', () => {
+  if (!BgCanvas.mode) return;
+  BgCanvas.resize();
+  BgCanvas.seed();
+  if (!settings.animations) BgCanvas.draw(performance.now(), 0);
+});
+document.addEventListener('mousemove', (e) => { BgCanvas.mouse.x = e.clientX; BgCanvas.mouse.y = e.clientY; });
+
+// ---------------- Looks: komplette Designs mit einem Klick ----------------
+const LOOK_BASE = {
+  accent_gradient: true, card_style: 'glass', glass_opacity: 50, glass_blur: 20, radius: 'normal', font: 'inter',
+  button_shape: 'normal', border_glow: false, glow_strength: 100, btn_shine: false,
+};
+const LOOKS = [
+  { name: 'Frosted Glass', tag: 'Glas · Mesh · Weiß-Violett', set: { theme: 'midnight', accent: '#ffffff', accent2: '#a855f7', pattern: 'mesh', glass_opacity: 42, glass_blur: 26, radius: 'round', glow_strength: 110 } },
+  { name: 'Cyber Neon', tag: 'OLED · Partikel · Neon', set: { theme: 'oled', accent: '#22d3ee', accent2: '#d946ef', pattern: 'particles', glass_opacity: 32, glass_blur: 14, radius: 'sharp', font: 'mono', border_glow: true, glow_strength: 165, btn_shine: true } },
+  { name: 'Sunset Drive', tag: 'Warm · Mesh · Pill', set: { theme: 'graphite', accent: '#fb923c', accent2: '#ec4899', pattern: 'mesh', glass_opacity: 55, radius: 'round', font: 'poppins', button_shape: 'pill', glow_strength: 125, btn_shine: true } },
+  { name: 'Deep Space', tag: 'Sterne · Glas · Blau', set: { theme: 'oled', accent: '#60a5fa', accent2: '#818cf8', pattern: 'stars', glass_opacity: 38, glass_blur: 16 } },
+  { name: 'Nordic Calm', tag: 'Nord · Aurora · Ruhig', set: { theme: 'nord', accent: '#88c0d0', accent2: '#b48ead', pattern: 'aurora', glass_opacity: 66, glass_blur: 18, radius: 'round', font: 'nunito', glow_strength: 80 } },
+  { name: 'Matrix', tag: 'Grün · Partikel · Terminal', set: { theme: 'oled', accent: '#22c55e', accent2: '#16a34a', accent_gradient: false, card_style: 'outline', pattern: 'particles', radius: 'sharp', font: 'mono', border_glow: true, glow_strength: 140 } },
+  { name: 'Clean Light', tag: 'Hell · Schwebend · Klar', set: { theme: 'light', accent: '#18181b', accent2: '#6366f1', accent_gradient: false, card_style: 'elevated', pattern: 'dots', radius: 'round', font: 'segoe', glow_strength: 60 } },
+  { name: 'Classic', tag: 'Der NEXUS-Standard', set: { theme: 'midnight', accent: '#ffffff', accent2: '#a855f7', accent_gradient: false, card_style: 'solid', pattern: 'none', glass_opacity: 60, glass_blur: 18 } },
+];
+const lookSettings = look => ({ ...LOOK_BASE, ...look.set });
+
+function renderLooks() {
+  const grid = document.getElementById('look-grid');
+  LOOKS.forEach((look, i) => {
+    const s = lookSettings(look);
+    const t = THEMES[s.theme];
+    const fill = s.accent_gradient ? `linear-gradient(90deg, ${s.accent}, ${s.accent2})` : s.accent;
+    const card = s.card_style === 'outline' ? 'transparent'
+      : s.card_style === 'glass' ? `color-mix(in srgb, ${t.surface} ${s.glass_opacity}%, transparent)` : t.surface;
+    const border = s.border_glow ? s.accent : `rgba(${t.tint}, 0.14)`;
+    const tile = document.createElement('button');
+    tile.className = 'look-tile';
+    tile.dataset.i = i;
+    tile.innerHTML = `<div class="look-prev" style="background: radial-gradient(70% 100% at 12% 15%, ${s.accent}55, transparent 70%),
+        radial-gradient(70% 100% at 92% 95%, ${s.accent2}66, transparent 70%), ${t.bg}; border-radius:${s.radius === 'sharp' ? 3 : s.radius === 'round' ? 12 : 8}px;">
+        <i style="background:${card}; border-color:${border}; --look-accent:${fill};"></i>
+        <i style="background:${card}; border-color:${border}; --look-accent:${fill};"></i>
+      </div><b>${esc(look.name)}</b><span>${esc(look.tag)}</span>`;
+    tile.addEventListener('click', async () => {
+      await saveSetting(lookSettings(look));
+      TactileAudio.done();
+      log(`Look „${look.name}“ aktiviert.`, true);
+    });
+    grid.appendChild(tile);
+  });
+}
+
+function syncLooks() {
+  document.querySelectorAll('.look-tile').forEach(tile => {
+    const s = lookSettings(LOOKS[tile.dataset.i]);
+    tile.classList.toggle('active', Object.entries(s).every(([k, v]) => String(settings[k]) === String(v)));
+  });
 }
 
 // ---------------- Einstellungs-Tabs & Übergänge ----------------
@@ -10509,9 +11475,58 @@ class NexusMonolithHandler(BaseHTTPRequestHandler):
         port = self.server.server_port
         return host in (f"127.0.0.1:{port}", f"localhost:{port}")
 
+    def _serve_background(self):
+        # <video>/<img> können keinen Header mitschicken, deshalb kommt der Token hier als ?t= in der URL
+        parsed = urllib.parse.urlparse(self.path)
+        token = urllib.parse.parse_qs(parsed.query).get("t", [""])[0]
+        entry = next((b for b in list_backgrounds() if b["id"] == parsed.path[4:]), None)
+        if not hmac.compare_digest(token, API_TOKEN) or not entry:
+            self.send_error(404)
+            return
+        path = bg_path(entry)
+        size = os.path.getsize(path)
+        start, end = 0, size - 1
+        # Range-Anfragen: Videos springen und loopen sauber, ohne alles neu zu laden
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start, end = int(m.group(1)), int(m.group(2)) if m.group(2) else size - 1
+            else:
+                start = max(0, size - int(m.group(2)))
+            end = min(end, size - 1)
+            if start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Type", BG_TYPES[entry["ext"]])
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    chunk = f.read(min(256 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (ConnectionError, OSError):
+            pass  # Browser bricht beim Spulen Anfragen ab – normal
+
     def do_GET(self):
         if not self._host_allowed():
             self.send_error(403)
+            return
+        if self.path.startswith("/bg/"):
+            self._serve_background()
             return
         body = HTML_UI.replace("__NEXUS_TOKEN__", API_TOKEN).encode("utf-8")
         self.send_response(200)
@@ -10528,6 +11543,10 @@ class NexusMonolithHandler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if self.path == "/api/bg_upload":
+                # Rohe Datei statt JSON: wird direkt auf die Platte gestreamt
+                self._send_json(receive_background(self.rfile, length, self.headers.get("X-File-Name")))
+                return
             payload = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
             self._route(payload)
         except Exception as e:
@@ -10739,8 +11758,12 @@ class NexusMonolithHandler(BaseHTTPRequestHandler):
                     "autosort": autosort_status(),
                     "commands": USER_DATA["commands"],
                     "settings": get_settings(),
+                    "backgrounds": list_backgrounds(),
                     "data_file": DATA_FILE
                 })
+
+        elif self.path == "/api/bg_delete":
+            self._send_json(delete_background(payload.get("id")))
 
         elif self.path == "/api/open_place":
             self._send_json({"ok": open_known_place(payload.get("key"))})
