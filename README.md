@@ -6,7 +6,7 @@
 
 **Dein ganzer Windows-PC in einem Dashboard.**
 
-Live-Monitor · Automationen · File Converter · Speedtest · Workspaces · 5 Themes<br>
+Sprachassistent „Hey Nexus“ · Live-Monitor · Automationen · File Converter · Speedtest · Workspaces · 5 Themes<br>
 alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkeit.
 
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#-installation)
@@ -37,6 +37,20 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
 ## 🔥 Highlights
 
 <table>
+  <tr>
+    <td width="33%" valign="top">
+      <h3>🎙️ „Hey Nexus“</h3>
+      Eingebauter Sprachassistent: „Hey Nexus, öffne Discord“, „erinnere mich in 10 Minuten an die Pizza“, „mach lauter“. Erkennung <b>offline</b>, Antworten mit warmer deutscher Stimme.
+    </td>
+    <td width="33%" valign="top">
+      <h3>🧠 Lokales KI-Gehirn</h3>
+      Optional mit Ollama (Qwen 2.5 / Llama 3.2): beantwortet freie Fragen und versteht lockere Sätze. Ein Klick zum Installieren, nichts verlässt deinen PC.
+    </td>
+    <td width="33%" valign="top">
+      <h3>☀️ Alltag</h3>
+      Workspaces öffnen mehrere Apps auf einmal, Erinnerungen als Popup, Fokus-Timer, Notizen und Text-Bausteine.
+    </td>
+  </tr>
   <tr>
     <td width="33%" valign="top">
       <h3>⚡ Automationen</h3>
@@ -72,6 +86,12 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
 ---
 
 ## 📸 Screenshots
+
+<img src="docs/screenshots/ai.png" alt="NEXUS AI: Sprachassistent mit Chat und Live-Erkennung" width="100%">
+
+<sub><b>NEXUS AI</b>: „Hey Nexus“ hört zu, zeigt live, was es versteht, und antwortet per Stimme</sub>
+
+<br><br>
 
 <table>
   <tr>
@@ -109,6 +129,33 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
 ## 🧩 Alle Features
 
 <details open>
+<summary><b>🎙️ NEXUS AI: Sprachassistent „Hey Nexus“</b></summary>
+
+- **Wakeword „Hey Nexus“** (auch „Hallo“ oder „Okay Nexus“): kurz sagen, Ding abwarten, Befehl sprechen. Oder alles in einem Satz.
+- **Spracherkennung komplett offline** über die in Windows eingebaute deutsche Spracherkennung.
+- **Natürliche Stimmen:** neuronale Offline-Stimmen über [Piper](https://github.com/OHF-Voice/piper1-gpl) – Kerstin, Ramona (weiblich) oder Thorsten (männlich). Auswählen genügt: NEXUS lädt die Stimme einmalig herunter (63–114 MB) und antwortet danach in ca. 0,2 s. Ohne Download sprechen die Windows-Stimmen (z.B. Katja).
+- Stimmlage (Gemütlich, Normal, Lebhaft) und Signalton (Sanft, Warm, Tropfen oder Aus) lassen sich wählen und vorher anhören.
+- **Links & Suchen im Lieblingsbrowser:** Brave, Chrome, Edge, Firefox oder der Windows-Standard; Browser starten dabei mit normalen Rechten, nicht als Admin.
+- Kennt automatisch **alle Apps aus deinem Startmenü** sowie Webseiten, Ordner, deine Workspaces und Custom Commands, inklusive deutscher Aussprache („Diskord“, „Spotifai“).
+- Geht auch **getippt**: per Chat in der Ansicht *Nexus AI*, über <kbd>Strg</kbd>+<kbd>K</kbd> → „NEXUS fragen: …“ oder mit <kbd>Strg</kbd>+<kbd>Leertaste</kbd> (einmal zuhören).
+
+| Sag … | NEXUS … |
+|---|---|
+| „Hey Nexus, öffne Discord“ | startet die App (mit normalen Rechten, nicht als Admin) |
+| „Erinnere mich in 10 Minuten an die Wäsche“ · „… um 18 Uhr an Sport“ | legt eine Erinnerung mit Popup an |
+| „Stell einen Timer auf 5 Minuten“ | Timer mit Popup und Ansage |
+| „Mach lauter“ · „Ton aus“ · „Nächstes Lied“ · „Pause“ | steuert Lautstärke und Musik |
+| „Suche auf YouTube nach Lofi Beats“ · „Suche nach Pizza in der Nähe“ | öffnet die Suche im Browser |
+| „Starte Workspace Gaming“ · „Führe Befehl Netzwerk Info aus“ | startet deine Workspaces und Befehle |
+| „Wie spät ist es?“ · „Systemstatus“ · „Mach einen Speedtest“ | antwortet per Stimme |
+| „Sortiere die Downloads“ · „Sperre den PC“ · „Caffeine an“ · „Zeig mir die Automationen“ | erledigt es sofort |
+
+- **KI-Gehirn (optional):** Mit einem lokalen Sprachmodell über [Ollama](https://ollama.com) beantwortet NEXUS auch freie Fragen und versteht lockere Formulierungen. Installation und Modell-Download sind ein Klick im Tool; das Modell darf nur die eingebauten Befehle auslösen.
+- Ohne KI-Gehirn werden unbekannte Fragen auf Wunsch gegoogelt.
+- Empfindlichkeit des Wakewords, Signalton und Sprachausgabe sind einstellbar.
+</details>
+
+<details>
 <summary><b>📊 Dashboard & Live-Monitor</b></summary>
 
 - Echtzeit-Graphen der letzten 60 Sekunden für **CPU, RAM, Download, Upload und GPU** (NVIDIA: Last, Temperatur, VRAM, Leistung)
@@ -205,16 +252,17 @@ Bilder laufen über die in Windows eingebauten Codecs (WPF/WIC). Für Audio und 
 | Python | 3.11 oder neuer ([python.org](https://www.python.org/downloads/), beim Setup „Add to PATH“ anhaken) |
 | Browser | Edge (bei Windows dabei), Chrome oder Brave: das Fenster öffnet sich als eigene App |
 | Optional | winget (bei Windows 11 dabei) für App-Updates · ffmpeg für Audio/Video (Ein-Klick-Installation im Tool) · NVIDIA-Treiber für die GPU-Kachel |
+| Für NEXUS AI | Mikrofon · deutsche Windows-Spracherkennung (bei deutschem Windows dabei, sonst unter *Zeit und Sprache → Sprache → Deutsch*) · optional Ollama fürs KI-Gehirn (Ein-Klick-Installation im Tool) |
 
 **Starten**
 
 ```powershell
 git clone https://github.com/BIGpapadoggy69/nexus-os.git
 cd nexus-os
-python nexus123.py
+python nexus.py
 ```
 
-Oder einfach oben auf **Code → Download ZIP** klicken, entpacken und `nexus123.py` doppelklicken.
+Oder einfach oben auf **Code → Download ZIP** klicken, entpacken und `nexus.py` doppelklicken.
 
 Windows fragt einmal nach Admin-Rechten (die braucht das Tool für Registry- und Netzwerk-Einstellungen), dann öffnet sich NEXUS OS in einem eigenen Fenster. Keine Installation, kein `pip install`, nichts.
 
@@ -240,6 +288,7 @@ Mitgeschickt werden nur Design-Einstellungen. Name, Module und persönliche Date
 | Kürzel | Aktion |
 |---|---|
 | <kbd>Strg</kbd> + <kbd>K</kbd> | Befehlssuche öffnen/schließen |
+| <kbd>Strg</kbd> + <kbd>Leertaste</kbd> | NEXUS AI: einmal zuhören (ohne „Hey Nexus“) |
 | <kbd>↑</kbd> <kbd>↓</kbd> <kbd>Enter</kbd> | In der Suche auswählen und ausführen |
 | <kbd>Enter</kbd> / <kbd>Esc</kbd> | Dialog bestätigen / abbrechen |
 | <kbd>Enter</kbd> | Welcome-Screen überspringen |
@@ -253,7 +302,8 @@ In der Suche funktionieren außerdem Rechnungen (`=2^10/4`) und Websuchen: einfa
 - Die Oberfläche läuft **nur lokal** auf `127.0.0.1` mit zufälligem Port, nichts ist aus dem Netzwerk erreichbar.
 - Jeder Start erzeugt einen **geheimen Token**. Fremde Webseiten können die API deshalb nicht ansprechen, ein Host-Check blockt DNS-Rebinding.
 - Alle Eingaben werden geprüft, bevor sie in PowerShell- oder Registry-Befehlen landen.
-- **Keine Telemetrie, keine Cloud, kein Account.** Ins Internet geht das Tool nur für Schriftarten (Google Fonts), den Speedtest (Cloudflare), Pings sowie winget/ffmpeg, wenn du sie benutzt.
+- **Keine Telemetrie, keine Cloud, kein Account.** Ins Internet geht das Tool nur für Schriftarten (Google Fonts), den Speedtest (Cloudflare), Pings sowie winget/ffmpeg/Ollama-Downloads, wenn du sie benutzt.
+- **Das Mikrofon ist standardmäßig aus.** Erst mit „Auf Hey Nexus hören“ lauscht NEXUS, und zwar lokal über die Windows-Spracherkennung. Audio verlässt nie den PC, Unterhaltungen werden nicht gespeichert. Solange das Mikrofon an ist, zeigt Windows wie gewohnt das Mikrofon-Symbol in der Taskleiste.
 
 **Wo liegen meine Daten?**
 
@@ -261,6 +311,7 @@ In der Suche funktionieren außerdem Rechnungen (`=2^10/4`) und Websuchen: einfa
 |---|---|
 | `%APPDATA%\NexusOS\user_data.json` | Workspaces, Erinnerungen, Notizen, Bausteine, Befehle, Automationen, Einstellungen |
 | `%PROGRAMDATA%\NexusOS\original_ids.json` | Gesicherte Original-Werte für „Alles auf Original“ |
+| `%APPDATA%\NexusOS\ai\` | Sprach-Engine (wird beim ersten Start kompiliert), Wortschatz für die Erkennung und, falls gewählt, natürliche Piper-Stimmen |
 
 > [!WARNING]
 > Notizen und Text-Bausteine liegen als Klartext auf der Platte, also bitte keine Passwörter speichern. **Custom Commands laufen mit Admin-Rechten:** Füge nur Befehle ein, die du verstehst.
@@ -268,6 +319,15 @@ In der Suche funktionieren außerdem Rechnungen (`=2^10/4`) und Websuchen: einfa
 ---
 
 ## ❓ FAQ
+
+<details>
+<summary><b>NEXUS AI reagiert nicht auf „Hey Nexus“.</b></summary>
+
+- Ist in der Ansicht *Nexus AI* der Schalter **„Auf Hey Nexus hören“** an? Das Mikrofon-Symbol oben bekommt dann einen grünen Punkt.
+- **Windows-Einstellungen → Datenschutz → Mikrofon:** „Desktop-Apps den Zugriff erlauben“ muss an sein, und das richtige Mikrofon muss als Standardgerät eingestellt sein.
+- Fehlt die deutsche Spracherkennung, zeigt NEXUS das direkt an. Nachinstallieren unter *Zeit und Sprache → Sprache → Deutsch → Optionen*.
+- Stell die Empfindlichkeit auf **„Empfindlich“** und betone das „Nexus“. Mit <kbd>Strg</kbd>+<kbd>Leertaste</kbd> geht's auch ganz ohne Wakeword.
+</details>
 
 <details>
 <summary><b>Es öffnet sich kein Fenster.</b></summary>
@@ -307,6 +367,7 @@ Nicht jedes Laufwerk meldet Temperatur, Verschleiß und Betriebsstunden an Windo
 - System-Daten direkt über Win32-APIs per `ctypes`: `GetIfTable2` (Netzwerk), `GetSystemTimes` (CPU), `IcmpSendEcho` (Ping), Toolhelp32 (Prozesse), `SHFileOperation` (Papierkorb)
 - Oberfläche: eine HTML-Seite mit Vanilla JS & CSS, lokal ausgeliefert und als Chromium-App-Fenster geöffnet
 - Bildkonvertierung über WPF/WIC, eigener PDF-Writer, Audio/Video über ffmpeg
+- Sprache: ein kleiner C#-Host auf Basis von `System.Speech` wird beim ersten Start per PowerShell kompiliert und zwischengespeichert. Die Grammatik entsteht aus deinen Startmenü-Apps (`Get-StartApps`), Workspaces und Befehlen; das Wakeword wird über die Wort-Konfidenz von „Nexus“ geprüft, damit normales Reden nichts auslöst.
 
 ---
 

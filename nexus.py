@@ -14,9 +14,11 @@ import socket
 import base64
 import ctypes
 import struct
+import difflib
 import hashlib
 import secrets
 import statistics
+import urllib.parse
 import urllib.request
 from ctypes import wintypes
 import tempfile
@@ -1375,7 +1377,15 @@ def launch_workspace(ws_id):
     started, failed = [], []
     for item in ws["items"]:
         target = os.path.expandvars(item)
-        # URIs wie https://, steam://, ms-settings: (min. 2 Zeichen, damit "C:" nicht als Schema gilt)
+        if re.match(r"^https?://", target, re.I):
+            # Webseiten im gewählten Browser (explorer.exe würde Adressen mit "=" zerlegen)
+            try:
+                open_url(target)
+                started.append(item)
+            except ValueError:
+                failed.append(item)
+            continue
+        # URIs wie steam://, ms-settings: (min. 2 Zeichen, damit "C:" nicht als Schema gilt)
         if re.match(r"^[a-z][a-z0-9+.-]+:", target, re.I) or os.path.exists(target):
             # Über explorer.exe starten: das Programm läuft dann mit normalen Rechten statt mit unseren Admin-Rechten
             subprocess.Popen(["explorer.exe", target])
@@ -1680,6 +1690,17 @@ DEFAULT_SETTINGS = {
     "toast_duration": 5,
     "clock_format": "24",
     "clock_seconds": True,
+    "browser": "brave",
+    # NEXUS AI (Mikrofon standardmäßig aus)
+    "ai_listen": False,
+    "ai_voice": True,
+    "ai_voice_name": "",  # leer = automatisch (Katja, falls vorhanden)
+    "ai_voice_style": "cozy",
+    "ai_sound": "soft",
+    "ai_sensitivity": "normal",
+    "ai_llm": True,
+    "ai_model": "qwen2.5:3b",
+    "ai_web_fallback": True,
 }
 
 SETTING_CHOICES = {
@@ -1706,10 +1727,16 @@ SETTING_CHOICES = {
     "toast_pos": ("top-right", "bottom-right", "bottom-center"),
     "toast_duration": (3, 5, 8),
     "clock_format": ("24", "12"),
+    "browser": ("brave", "chrome", "edge", "firefox", "default"),
+    "ai_sensitivity": ("low", "normal", "high"),
+    "ai_voice_style": ("cozy", "normal", "lively"),
+    "ai_sound": ("soft", "warm", "drop", "off"),
+    "ai_model": ("qwen2.5:3b", "llama3.2:3b", "qwen2.5:7b"),
 }
 SETTING_BOOLS = ("sound", "glow", "animations", "show_console", "nav_numbers", "accent_gradient",
-                 "mono_values", "hover_lift", "welcome", "clock_seconds")
-SETTING_TEXTS = {"brand_name": 32, "brand_tag": 24, "welcome_name": 32}
+                 "mono_values", "hover_lift", "welcome", "clock_seconds",
+                 "ai_listen", "ai_voice", "ai_llm", "ai_web_fallback")
+SETTING_TEXTS = {"brand_name": 32, "brand_tag": 24, "welcome_name": 32, "ai_voice_name": 80}
 DASH_SECTIONS = ("hero", "metrics", "monitor", "bottom")
 
 def get_settings():
@@ -2419,12 +2446,87 @@ def undo_renames():
     LAST_RENAME_HISTORY = []
     return restored
 
+# ---------------- Programme mit normalen Rechten starten & Links im Browser öffnen ----------------
+
+class STARTUPINFOW(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR), ("lpDesktop", wintypes.LPWSTR),
+                ("lpTitle", wintypes.LPWSTR), ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD), ("dwXCountChars", wintypes.DWORD),
+                ("dwYCountChars", wintypes.DWORD), ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD), ("lpReserved2", ctypes.c_void_p),
+                ("hStdInput", wintypes.HANDLE), ("hStdOutput", wintypes.HANDLE), ("hStdError", wintypes.HANDLE)]
+
+class PROCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+def launch_as_user(command_line):
+    """Startet ein Programm mit den Rechten des angemeldeten Nutzers (Token des Explorers) statt als Admin.
+    Anders als der explorer.exe-Trick gehen dabei auch Argumente wie eine URL mit."""
+    if not is_admin():
+        subprocess.Popen(command_line)
+        return
+    user32, k32, adv = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.advapi32
+    user32.GetShellWindow.restype = wintypes.HWND
+    k32.OpenProcess.restype = wintypes.HANDLE
+    pid = wintypes.DWORD()
+    hwnd = user32.GetShellWindow()
+    if not hwnd or not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
+        raise OSError("Der Windows-Explorer läuft nicht")
+    proc = k32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    token, primary = wintypes.HANDLE(), wintypes.HANDLE()
+    try:
+        if not proc or not adv.OpenProcessToken(wintypes.HANDLE(proc), 0x0002, ctypes.byref(token)):  # TOKEN_DUPLICATE
+            raise ctypes.WinError()
+        # ASSIGN_PRIMARY | DUPLICATE | QUERY | ADJUST_DEFAULT | ADJUST_SESSIONID, SecurityImpersonation, TokenPrimary
+        if not adv.DuplicateTokenEx(token, 0x018B, None, 2, 1, ctypes.byref(primary)):
+            raise ctypes.WinError()
+        si, pi = STARTUPINFOW(), PROCESS_INFORMATION()
+        si.cb = ctypes.sizeof(si)
+        cmd = ctypes.create_unicode_buffer(command_line)
+        if not adv.CreateProcessWithTokenW(primary, 0, None, cmd, 0, None, None, ctypes.byref(si), ctypes.byref(pi)):
+            raise ctypes.WinError()
+        k32.CloseHandle(pi.hProcess)
+        k32.CloseHandle(pi.hThread)
+    finally:
+        for handle in (primary, token):
+            if handle:
+                k32.CloseHandle(handle)
+        if proc:
+            k32.CloseHandle(wintypes.HANDLE(proc))
+
+BROWSERS = {
+    "brave": (r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+              r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
+              r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+    "chrome": (r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+               r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+               r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    "edge": (r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+             r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+    "firefox": (r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+                r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe"),
+}
+
+def find_browser(key):
+    return next((p for p in map(os.path.expandvars, BROWSERS.get(key, ())) if os.path.exists(p)), None)
+
+def installed_browsers():
+    return [key for key in BROWSERS if find_browser(key)]
+
 def open_url(url):
     url = str(url or "")
     if not re.fullmatch(r"https?://[^\s\"']{1,2000}", url):
         raise ValueError("Ungültige Adresse")
-    # explorer.exe öffnet den Standardbrowser mit normalen Rechten
-    subprocess.Popen(["explorer.exe", url])
+    # Nicht über explorer.exe: der zerlegt Adressen an "=" und "," (z.B. "?search_query=…")
+    # und öffnet dann nur ein Explorer-Fenster. Fehlt der gewählte Browser, nimmt Windows den Standardbrowser.
+    exe = find_browser(get_settings()["browser"])
+    handler = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "rundll32.exe")
+    try:
+        launch_as_user(f'"{exe}" "{url}"' if exe else f'"{handler}" url.dll,FileProtocolHandler {url}')
+    except OSError:
+        # Notlösung als Admin: ein schon laufender Browser übernimmt den Link trotzdem in sein Fenster
+        subprocess.Popen([exe, url] if exe else [handler, "url.dll,FileProtocolHandler", url])
     return True
 
 # =====================================================================
@@ -2890,6 +2992,1862 @@ def pick_paths_dialog(mode):
                          creationflags=subprocess.CREATE_NO_WINDOW, timeout=900)
     out = res.stdout.strip().lstrip("﻿")
     return json.loads(out) if out else []
+
+# =====================================================================
+# MODULE 11: NEXUS AI – SPRACHASSISTENT ("HEY NEXUS")
+# =====================================================================
+# Offline: Windows-Spracherkennung (System.Speech, de-DE) in einem eigenen PowerShell-Prozess,
+# Befehle per Regeln, freie Fragen optional über ein lokales Sprachmodell (Ollama).
+
+AI_DIR = os.path.join(os.path.dirname(DATA_FILE), "ai")
+AI_CONFIG = os.path.join(AI_DIR, "vocab.cfg")
+
+SPEECH_HOST_CS = r"""
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Media;
+using System.Reflection;
+using System.Speech.AudioFormat;
+using System.Speech.Recognition;
+using System.Speech.Synthesis;
+using System.Text;
+using System.Threading;
+
+// Sprach-Host für NEXUS AI: Windows-Spracherkennung (offline, de-DE) + Sprachausgabe.
+// Ereignisse als JSON-Zeilen auf stdout, Befehle als Tab-getrennte Zeilen auf stdin.
+public static class NexusSpeech
+{
+    static SpeechRecognitionEngine rec;
+    static SpeechSynthesizer tts;
+    static CultureInfo culture;
+    static readonly object OutLock = new object();
+    static readonly List<Grammar> ListenGrammars = new List<Grammar>();
+    static readonly List<Grammar> WakeCommandGrammars = new List<Grammar>();
+    static volatile bool listening;
+    static volatile bool micOn;
+    static volatile bool speaking;
+    static volatile string chimeStyle = "soft";
+    static DateTime chimeEnd = DateTime.MinValue;
+    static volatile bool debug;
+    static volatile string pendingReload;
+    static DateTime speakEnded = DateTime.MinValue;
+    static DateTime lastLevel = DateTime.MinValue;
+    static DateTime lastHypothesis = DateTime.MinValue;
+    static Timer listenTimer;
+    // Gemessen am Wort "Nexus": echtes Wakeword ~0.75, normales Gerede 0.0
+    static double wakeThreshold = 0.35;
+    // Nach dem Wakeword ist die Grammatik eng, da reicht weniger Sicherheit ("öffne spotify" kam mit 0.25)
+    static double commandThreshold = 0.2;
+    const int WakeWords = 2;  // alle Wake-Phrasen bestehen aus zwei Wörtern ("hey nexus")
+    const string Dictation = "\u0001DICTATION";
+
+    static string Esc(string s)
+    {
+        var sb = new StringBuilder();
+        foreach (char c in s ?? "")
+        {
+            if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+            else if (c < 0x20) sb.AppendFormat("\\u{0:x4}", (int)c);
+            else sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    static string Num(double v)
+    {
+        return v.ToString("0.00", CultureInfo.InvariantCulture);
+    }
+
+    static void Emit(string json)
+    {
+        lock (OutLock)
+        {
+            Console.Out.WriteLine(json);
+            Console.Out.Flush();
+        }
+    }
+
+    static void EmitState()
+    {
+        string state = listening ? "listening" : (micOn ? "idle" : "off");
+        Emit("{\"type\":\"state\",\"value\":\"" + state + "\"}");
+    }
+
+    // string = festes Wort/Phrase, string[] = Auswahl, GrammarBuilder = Teilstück, Dictation = freier Text
+    static GrammarBuilder Seq(params object[] parts)
+    {
+        var gb = new GrammarBuilder();
+        gb.Culture = culture;
+        foreach (var part in parts)
+        {
+            if (part is string && (string)part == Dictation) gb.AppendDictation();
+            else if (part is string) gb.Append((string)part);
+            else if (part is string[]) gb.Append(new Choices((string[])part));
+            else if (part is GrammarBuilder) gb.Append((GrammarBuilder)part);
+        }
+        return gb;
+    }
+
+    // Ein einzelnes string[] würde als params-Array selbst durchgereicht (= Wörter hintereinander statt Auswahl)
+    static GrammarBuilder OneOf(string[] words)
+    {
+        return Seq(new object[] { words });
+    }
+
+    static GrammarBuilder Opt(params string[] words)
+    {
+        var gb = new GrammarBuilder();
+        gb.Culture = culture;
+        gb.Append(new Choices(words), 0, 1);
+        return gb;
+    }
+
+    // Jeder Befehl zweimal: allein (nach "Hey Nexus" + Pause) und mit Wakeword davor (in einem Atemzug)
+    static void AddPair(string name, GrammarBuilder body, string[] wake, float weight, bool withWake)
+    {
+        var bare = new Grammar(body);
+        bare.Name = name;
+        bare.Weight = weight;
+        bare.Enabled = false;
+        rec.LoadGrammar(bare);
+        ListenGrammars.Add(bare);
+        if (!withWake) return;
+
+        var prefixed = new Grammar(Seq(wake, body));
+        prefixed.Name = "wake:" + name;
+        prefixed.Weight = weight;
+        rec.LoadGrammar(prefixed);
+        WakeCommandGrammars.Add(prefixed);
+    }
+
+    static void BuildGrammars(Dictionary<string, string[]> cfg)
+    {
+        string[] wake = cfg["wake"];
+        var wakeOnly = new Grammar(OneOf(wake));
+        wakeOnly.Name = "wake";
+        rec.LoadGrammar(wakeOnly);
+
+        string[] openVerbs = { "öffne", "öffnen", "starte", "start", "zeig", "zeige", "mach", "geh auf" };
+        string[] units = { "minute", "minuten", "sekunde", "sekunden", "stunde", "stunden" };
+        string[] nums = cfg["num"];
+
+        if (cfg["target"].Length > 0)
+            AddPair("open", Seq(openVerbs, Opt("mir", "mal", "bitte"), Opt("den", "die", "das", "meine", "meinen"), cfg["target"], Opt("auf", "bitte")), wake, 1f, true);
+        if (cfg["ws"].Length > 0)
+            AddPair("workspace", Seq(new[] { "starte", "öffne", "lade" }, Opt("den", "meinen", "das"), "workspace", cfg["ws"]), wake, 1f, true);
+        if (cfg["cmd"].Length > 0)
+            AddPair("command", Seq(new[] { "führe", "starte" }, Opt("den befehl", "befehl"), cfg["cmd"], Opt("aus")), wake, 1f, true);
+        AddPair("reminder", Seq(new[] { "erinnere mich", "erinner mich" }, "in", nums, units, new[] { "an", "daran" }, Dictation), wake, 1f, true);
+        AddPair("reminder_at", Seq(new[] { "erinnere mich", "erinner mich" }, "um", nums, "uhr", Opt(nums), new[] { "an", "daran" }, Dictation), wake, 1f, true);
+        AddPair("timer", Seq(new[] { "stell", "stelle", "starte" }, Opt("einen", "den"), "timer", new[] { "auf", "für" }, nums, units), wake, 1f, true);
+        AddPair("youtube", Seq(new[] { "suche", "such", "spiele", "spiel" }, new[] { "auf youtube", "bei youtube" }, Opt("nach"), Dictation), wake, 1f, true);
+        AddPair("search", Seq(new[] { "suche", "such", "google" }, Opt("nach", "im internet nach"), Dictation), wake, 0.9f, true);
+        if (cfg["fixed"].Length > 0)
+            AddPair("fixed", OneOf(cfg["fixed"]), wake, 1f, true);
+        // Freies Diktat nur nach dem Wakeword: im Ruhezustand würde es den Anfang des nächsten
+        // Satzes verschlucken ("Er|innere mich ...") und feste Befehle überstimmen
+        AddPair("dictation", Seq(Dictation), wake, 0.5f, false);
+    }
+
+    static void SetListening(bool on)
+    {
+        listening = on;
+        foreach (var g in ListenGrammars) g.Enabled = on;
+        // Beim Zuhören konkurrieren die "Hey Nexus …"-Varianten nur mit dem eigentlichen Befehl
+        foreach (var g in WakeCommandGrammars) g.Enabled = !on;
+        if (listenTimer != null) listenTimer.Dispose();
+        listenTimer = null;
+        if (on)
+        {
+            listenTimer = new Timer(_ =>
+            {
+                if (!listening) return;
+                SetListening(false);
+                Emit("{\"type\":\"listen_end\"}");
+            }, null, 8000, Timeout.Infinite);
+        }
+        EmitState();
+    }
+
+    // ---------- Klänge: Signaltöne und Sprachausgabe über PlaySound ----------
+
+    static readonly object PlayLock = new object();
+    static readonly Dictionary<string, byte[]> Chimes = new Dictionary<string, byte[]>();
+    static SoundPlayer currentPlayer;  // Referenz halten, solange der Klang aus dem Speicher spielt
+    static int speechGen;
+
+    static byte[] Wav(float[] x, int rate)
+    {
+        var ms = new MemoryStream();
+        var w = new BinaryWriter(ms);
+        int bytes = x.Length * 2;
+        w.Write(Encoding.ASCII.GetBytes("RIFF")); w.Write(36 + bytes); w.Write(Encoding.ASCII.GetBytes("WAVE"));
+        w.Write(Encoding.ASCII.GetBytes("fmt ")); w.Write(16); w.Write((short)1); w.Write((short)1);
+        w.Write(rate); w.Write(rate * 2); w.Write((short)2); w.Write((short)16);
+        w.Write(Encoding.ASCII.GetBytes("data")); w.Write(bytes);
+        foreach (var v in x) w.Write((short)Math.Max(-32767, Math.Min(32767, v * 32767)));
+        return ms.ToArray();
+    }
+
+    // Weicher, gezupfter Ton (Kalimba-artig): Grundton + leise, schnell verklingende Obertöne
+    static void Pluck(float[] buf, int rate, double start, double freq, double amp, double decay)
+    {
+        int s0 = (int)(start * rate);
+        for (int i = s0; i < buf.Length; i++)
+        {
+            double t = (i - s0) / (double)rate;
+            double v = Math.Sin(2 * Math.PI * freq * t)
+                     + 0.18 * Math.Exp(-t / 0.06) * Math.Sin(2 * Math.PI * 2 * freq * t)
+                     + 0.05 * Math.Exp(-t / 0.03) * Math.Sin(2 * Math.PI * 3.01 * freq * t);
+            buf[i] += (float)(amp * (1 - Math.Exp(-t / 0.006)) * Math.Exp(-t / decay) * v);
+        }
+    }
+
+    static byte[] MakeChime(string style)
+    {
+        const int rate = 44100;
+        float[] buf;
+        if (style == "drop")
+        {
+            // Wassertropfen: kurzer Sinus, der sanft nach oben gleitet
+            buf = new float[(int)(0.28 * rate)];
+            double phase = 0;
+            for (int i = 0; i < buf.Length; i++)
+            {
+                double t = i / (double)rate;
+                phase += 2 * Math.PI * (480 + 520 * (1 - Math.Exp(-t / 0.045))) / rate;
+                buf[i] = (float)(0.22 * (1 - Math.Exp(-t / 0.004)) * Math.Exp(-t / 0.07) * Math.Sin(phase));
+            }
+        }
+        else if (style == "warm")
+        {
+            // Ein tiefer, warmer Glockenton mit leiser Oktave
+            buf = new float[(int)(0.9 * rate)];
+            Pluck(buf, rate, 0, 392.0, 0.17, 0.3);
+            Pluck(buf, rate, 0, 784.0, 0.04, 0.16);
+        }
+        else
+        {
+            // Sanft: zwei weiche Töne nach oben (G4 -> C5), ein freundliches "dü-dum"
+            buf = new float[(int)(0.65 * rate)];
+            Pluck(buf, rate, 0, 392.0, 0.15, 0.16);
+            Pluck(buf, rate, 0.12, 523.25, 0.15, 0.2);
+        }
+        int fade = (int)(0.03 * rate);
+        for (int i = 0; i < fade; i++) buf[buf.Length - 1 - i] *= i / (float)fade;
+        return Wav(buf, rate);
+    }
+
+    static double PlayChime(string style)
+    {
+        if (style == "off") return 0;
+        byte[] wav;
+        lock (Chimes)
+        {
+            if (!Chimes.TryGetValue(style, out wav)) Chimes[style] = wav = MakeChime(style);
+        }
+        var player = new SoundPlayer(new MemoryStream(wav));
+        lock (PlayLock)
+        {
+            if (currentPlayer != null) currentPlayer.Stop();
+            currentPlayer = player;
+        }
+        try { player.Play(); } catch { }
+        return (wav.Length - 44) / 88200.0;
+    }
+
+    static void PlayChime()
+    {
+        double seconds = PlayChime(chimeStyle);
+        // Den eigenen Signalton nicht als Anfang des Befehls verstehen
+        chimeEnd = DateTime.Now.AddSeconds(seconds * 0.6);
+    }
+
+    static bool IsChimeEcho(RecognitionResult r)
+    {
+        try { return r != null && r.Audio != null && r.Audio.StartTime + r.Audio.Duration < chimeEnd; }
+        catch { return false; }
+    }
+
+    // ---------- Sprachausgabe: WinRT-Stimmen (z.B. Katja) per Reflection, sonst SAPI ----------
+
+    static Type winrtSynthType;
+    static object winrtSynth;
+    static MethodInfo asTask;
+    static MethodInfo asStream;
+    static readonly List<object> WinrtVoices = new List<object>();
+    static bool useWinrt;
+    static string voiceName = "";
+
+    static string Prop(object o, string name)
+    {
+        return Convert.ToString(o.GetType().GetProperty(name).GetValue(o, null), CultureInfo.InvariantCulture);
+    }
+
+    static void InitWinrt()
+    {
+        try
+        {
+            winrtSynthType = Type.GetType("Windows.Media.SpeechSynthesis.SpeechSynthesizer, Windows.Media.SpeechSynthesis, ContentType=WindowsRuntime", true);
+            var rt = Assembly.Load("System.Runtime.WindowsRuntime, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089");
+            asTask = rt.GetType("System.WindowsRuntimeSystemExtensions").GetMethods()
+                .First(m => m.Name == "AsTask" && m.IsGenericMethod && m.GetParameters().Length == 1
+                            && m.GetParameters()[0].ParameterType.Name == "IAsyncOperation`1");
+            asStream = rt.GetType("System.IO.WindowsRuntimeStreamExtensions").GetMethods()
+                .First(m => m.Name == "AsStreamForRead" && m.GetParameters().Length == 1);
+            winrtSynth = Activator.CreateInstance(winrtSynthType);
+            foreach (var v in (IEnumerable)winrtSynthType.GetProperty("AllVoices").GetValue(null, null))
+                if (Prop(v, "Language").StartsWith("de")) WinrtVoices.Add(v);
+        }
+        catch
+        {
+            winrtSynth = null;  // ältere Windows-Versionen: nur SAPI-Stimmen
+        }
+    }
+
+    static List<string[]> VoiceList()
+    {
+        var list = WinrtVoices.Select(v => new[] { Prop(v, "DisplayName"), "winrt", Prop(v, "Gender") }).ToList();
+        foreach (var v in tts.GetInstalledVoices(culture).Where(v => v.Enabled))
+            if (!list.Any(x => x[0] == v.VoiceInfo.Name)) list.Add(new[] { v.VoiceInfo.Name, "sapi", v.VoiceInfo.Gender.ToString() });
+        return list;
+    }
+
+    static void EmitVoices()
+    {
+        var items = VoiceList().Select(v => "{\"name\":\"" + Esc(v[0]) + "\",\"engine\":\"" + v[1] + "\",\"gender\":\"" + Esc(v[2]) + "\"}");
+        Emit("{\"type\":\"voices\",\"items\":[" + string.Join(",", items) + "]}");
+    }
+
+    // Stimmlage: gemütlich = etwas langsamer und tiefer, wie eine ruhige, warme Stimme
+    static void SetVoice(string name, string style)
+    {
+        double rate = style == "lively" ? 1.1 : style == "normal" ? 1.0 : 0.9;
+        double pitch = style == "lively" ? 1.04 : style == "normal" ? 1.0 : 0.92;
+        object winrtVoice = null;
+        if (winrtSynth != null)
+        {
+            winrtVoice = string.IsNullOrEmpty(name)
+                ? (WinrtVoices.FirstOrDefault(v => Prop(v, "DisplayName").Contains("Katja"))
+                   ?? WinrtVoices.FirstOrDefault(v => Prop(v, "Gender") == "Female") ?? WinrtVoices.FirstOrDefault())
+                : WinrtVoices.FirstOrDefault(v => Prop(v, "DisplayName") == name);
+        }
+        try
+        {
+            if (winrtVoice != null)
+            {
+                winrtSynthType.GetProperty("Voice").SetValue(winrtSynth, winrtVoice, null);
+                var options = winrtSynthType.GetProperty("Options").GetValue(winrtSynth, null);
+                options.GetType().GetProperty("SpeakingRate").SetValue(options, rate, null);
+                options.GetType().GetProperty("AudioPitch").SetValue(options, pitch, null);
+                useWinrt = true;
+                voiceName = Prop(winrtVoice, "DisplayName");
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(name)) tts.SelectVoice(name);
+                tts.Rate = style == "lively" ? 1 : style == "normal" ? 0 : -1;
+                useWinrt = false;
+                voiceName = tts.Voice.Name;
+            }
+        }
+        catch (Exception ex)
+        {
+            Emit("{\"type\":\"error\",\"message\":\"Stimme nicht verfügbar: " + Esc(ex.Message) + "\"}");
+        }
+        Emit("{\"type\":\"voice\",\"name\":\"" + Esc(voiceName) + "\",\"engine\":\"" + (useWinrt ? "winrt" : "sapi") + "\"}");
+    }
+
+    static byte[] SynthWinrt(string text)
+    {
+        var method = winrtSynthType.GetMethod("SynthesizeTextToStreamAsync");
+        var op = method.Invoke(winrtSynth, new object[] { text });
+        var task = asTask.MakeGenericMethod(method.ReturnType.GetGenericArguments()[0]).Invoke(null, new[] { op });
+        var stream = task.GetType().GetProperty("Result").GetValue(task, null);
+        using (var s = (Stream)asStream.Invoke(null, new[] { stream }))
+        using (var ms = new MemoryStream())
+        {
+            s.CopyTo(ms);
+            return ms.ToArray();
+        }
+    }
+
+    static void SpeechDone(int gen)
+    {
+        if (gen != speechGen) return;  // eine neuere Ausgabe läuft schon
+        speaking = false;
+        speakEnded = DateTime.Now;
+        Emit("{\"type\":\"speak_end\"}");
+    }
+
+    static void Say(string text)
+    {
+        int gen = Interlocked.Increment(ref speechGen);
+        StopAudio();
+        speaking = true;
+        if (!useWinrt)
+        {
+            tts.SpeakAsync(text);
+            return;
+        }
+        new Thread(() => PlaySpeech(gen, () => SynthWinrt(text))) { IsBackground = true }.Start();
+    }
+
+    // Fertige WAV-Datei als Sprache abspielen (z.B. von Piper), mit denselben Regeln wie eigene Ausgaben
+    static void PlayFile(string path)
+    {
+        int gen = Interlocked.Increment(ref speechGen);
+        StopAudio();
+        speaking = true;
+        byte[] wav;
+        try { wav = File.ReadAllBytes(path); }
+        catch (Exception ex)
+        {
+            Emit("{\"type\":\"error\",\"message\":\"Sprachdatei fehlt: " + Esc(ex.Message) + "\"}");
+            SpeechDone(gen);
+            return;
+        }
+        new Thread(() => PlaySpeech(gen, () => wav)) { IsBackground = true }.Start();
+    }
+
+    static void PlaySpeech(int gen, Func<byte[]> getWav)
+    {
+        try
+        {
+            byte[] wav = getWav();
+            if (gen != speechGen) return;
+            var player = new SoundPlayer(new MemoryStream(wav));
+            lock (PlayLock) { currentPlayer = player; }
+            player.PlaySync();  // endet auch, wenn ein anderer Klang oder "stopsay" dazwischenkommt
+        }
+        catch (Exception ex)
+        {
+            Emit("{\"type\":\"error\",\"message\":\"Sprachausgabe fehlgeschlagen: " + Esc(ex.Message) + "\"}");
+        }
+        SpeechDone(gen);
+    }
+
+    static void StopAudio()
+    {
+        lock (PlayLock)
+        {
+            if (currentPlayer != null) currentPlayer.Stop();
+        }
+        try { tts.SpeakAsyncCancelAll(); } catch { }
+    }
+
+    static void EmitDebug(string kind, RecognitionResult r)
+    {
+        if (!debug || r == null) return;
+        var alts = r.Alternates.Take(3).Select(a => "{\"g\":\"" + Esc(a.Grammar == null ? "" : a.Grammar.Name) + "\",\"t\":\"" + Esc(a.Text) + "\",\"c\":"
+            + Num(a.Confidence) + ",\"w\":[" + string.Join(",", a.Words.Select(w => Num(w.Confidence))) + "]}");
+        string timing = "";
+        try { timing = ",\"audio\":\"start " + r.Audio.StartTime.ToString("HH:mm:ss.fff") + " pos " + r.Audio.AudioPosition + " dur " + r.Audio.Duration + " now " + DateTime.Now.ToString("HH:mm:ss.fff") + "\""; } catch { }
+        Emit("{\"type\":\"debug\",\"kind\":\"" + kind + "\",\"alts\":[" + string.Join(",", alts) + "]" + timing + "}");
+    }
+
+    // Maßgeblich ist das Wort "Nexus": "Hey" wird oft als "hi" gehört (Konfidenz 0.1–0.3)
+    static double WakeConf(RecognitionResult r)
+    {
+        return r.Words.Count >= WakeWords ? r.Words[WakeWords - 1].Confidence : 0;
+    }
+
+    static void Wake(double conf)
+    {
+        Emit("{\"type\":\"wake\",\"conf\":" + Num(conf) + "}");
+        PlayChime();
+        SetListening(true);
+    }
+
+    static void EmitHeard(string text, double conf, string kind, bool wake)
+    {
+        Emit("{\"type\":\"heard\",\"text\":\"" + Esc(text) + "\",\"conf\":" + Num(conf)
+             + ",\"kind\":\"" + Esc(kind) + "\",\"wake\":" + (wake ? "true" : "false") + "}");
+    }
+
+    static void OnRecognized(object sender, SpeechRecognizedEventArgs e)
+    {
+        var r = e.Result;
+        EmitDebug("recognized", r);
+        // Eigene Sprachausgabe nicht als Befehl verstehen
+        if (speaking || (DateTime.Now - speakEnded).TotalMilliseconds < 700) return;
+        string name = r.Grammar.Name ?? "";
+        if (name.StartsWith("wake"))
+        {
+            double wakeConf = WakeConf(r);
+            if (wakeConf < wakeThreshold)
+            {
+                if (debug) Emit("{\"type\":\"ignored\",\"text\":\"" + Esc(r.Text) + "\",\"conf\":" + Num(wakeConf) + "}");
+                return;
+            }
+            var restWords = r.Words.Skip(WakeWords).ToList();
+            double restConf = restWords.Count > 0 ? restWords.Average(w => (double)w.Confidence) : 0;
+            // Wakeword sicher, Befehl dahinter nur geraten: wie ein reines "Hey Nexus" behandeln und zuhören
+            if (name == "wake" || restConf < commandThreshold)
+            {
+                Wake(wakeConf);
+                return;
+            }
+            EmitHeard(string.Join(" ", restWords.Select(w => w.Text)), restConf, name.Substring(5), true);
+            SetListening(false);
+            return;
+        }
+        if (!listening || IsChimeEcho(r)) return;
+        if (r.Confidence < commandThreshold)
+        {
+            Emit("{\"type\":\"rejected\",\"text\":\"" + Esc(r.Text) + "\"}");
+            SetListening(false);
+            return;
+        }
+        EmitHeard(r.Text, r.Confidence, name, false);
+        SetListening(false);
+    }
+
+    static void OnRejected(object sender, SpeechRecognitionRejectedEventArgs e)
+    {
+        EmitDebug("rejected", e.Result);
+        if (speaking) return;
+        var r = e.Result;
+        if (!listening)
+        {
+            // Ein kurzes, verworfenes "Hey Nexus" trotzdem als Wakeword werten, wenn "Nexus" sicher ist
+            if (r != null && r.Grammar != null && r.Grammar.Name == "wake" && WakeConf(r) >= wakeThreshold)
+                Wake(WakeConf(r));
+            return;  // im Ruhezustand sind Ablehnungen normales Hintergrundrauschen
+        }
+        if (IsChimeEcho(r)) return;
+        Emit("{\"type\":\"rejected\",\"text\":\"\"}");
+        SetListening(false);
+    }
+
+    static void OnHypothesized(object sender, SpeechHypothesizedEventArgs e)
+    {
+        if (!listening || (DateTime.Now - lastHypothesis).TotalMilliseconds < 150) return;
+        lastHypothesis = DateTime.Now;
+        Emit("{\"type\":\"hypothesis\",\"text\":\"" + Esc(e.Result.Text) + "\"}");
+    }
+
+    static void OnLevel(object sender, AudioLevelUpdatedEventArgs e)
+    {
+        if ((DateTime.Now - lastLevel).TotalMilliseconds < 100) return;
+        lastLevel = DateTime.Now;
+        Emit("{\"type\":\"level\",\"value\":" + e.AudioLevel + "}");
+    }
+
+    static void MicOn()
+    {
+        if (micOn) return;
+        try
+        {
+            rec.SetInputToDefaultAudioDevice();
+            rec.RecognizeAsync(RecognizeMode.Multiple);
+            micOn = true;
+        }
+        catch (Exception ex)
+        {
+            Emit("{\"type\":\"error\",\"message\":\"Kein Mikrofon gefunden: " + Esc(ex.Message) + "\"}");
+        }
+        SetListening(false);
+    }
+
+    static void MicOff()
+    {
+        if (micOn)
+        {
+            try { rec.RecognizeAsyncCancel(); } catch { }
+        }
+        micOn = false;
+        SetListening(false);
+    }
+
+    static Dictionary<string, string[]> ReadConfig(string path)
+    {
+        var cfg = new Dictionary<string, string[]>();
+        var lines = File.ReadAllLines(path, Encoding.UTF8);
+        foreach (var key in new[] { "wake", "target", "ws", "cmd", "num", "fixed" })
+        {
+            string prefix = key + "|";
+            cfg[key] = lines.Where(l => l.StartsWith(prefix)).Select(l => l.Substring(prefix.Length).Trim())
+                            .Where(v => v.Length > 0).Distinct().ToArray();
+        }
+        return cfg;
+    }
+
+    static void Reload(string path)
+    {
+        try
+        {
+            rec.UnloadAllGrammars();
+            ListenGrammars.Clear();
+            WakeCommandGrammars.Clear();
+            BuildGrammars(ReadConfig(path));
+            SetListening(false);
+            Emit("{\"type\":\"reloaded\"}");
+        }
+        catch (Exception ex)
+        {
+            Emit("{\"type\":\"error\",\"message\":\"Wortschatz konnte nicht geladen werden: " + Esc(ex.Message) + "\"}");
+        }
+    }
+
+    public static void Run(string configPath, string waveFile)
+    {
+        Console.OutputEncoding = new UTF8Encoding(false);
+        Console.InputEncoding = new UTF8Encoding(false);
+        culture = new CultureInfo("de-DE");
+        Thread.CurrentThread.CurrentCulture = culture;
+        Thread.CurrentThread.CurrentUICulture = culture;
+
+        try
+        {
+            rec = new SpeechRecognitionEngine(culture);
+        }
+        catch (Exception ex)
+        {
+            Emit("{\"type\":\"error\",\"message\":\"Deutsche Spracherkennung fehlt (Windows-Einstellungen > Zeit und Sprache > Sprache > Deutsch > Spracherkennung): " + Esc(ex.Message) + "\"}");
+            return;
+        }
+        BuildGrammars(ReadConfig(configPath));
+        // Windows verwirft kurze Äußerungen sonst zu früh; die eigentliche Prüfung machen wir über die Wort-Konfidenzen
+        try { rec.UpdateRecognizerSetting("CFGConfidenceRejectionThreshold", 20); } catch { }
+        rec.SpeechRecognized += OnRecognized;
+        rec.SpeechRecognitionRejected += OnRejected;
+        rec.SpeechHypothesized += OnHypothesized;
+        rec.AudioLevelUpdated += OnLevel;
+        // Grammatiken nur an einem sicheren Punkt der laufenden Erkennung austauschen
+        rec.RecognizerUpdateReached += (s, e) =>
+        {
+            string p = pendingReload;
+            pendingReload = null;
+            if (p != null) Reload(p);
+        };
+
+        tts = new SpeechSynthesizer();
+        try { tts.SelectVoiceByHints(VoiceGender.NotSet, VoiceAge.NotSet, 0, culture); } catch { }
+        tts.SetOutputToDefaultAudioDevice();
+        tts.SpeakStarted += (s, e) => { speaking = true; };
+        tts.SpeakCompleted += (s, e) => SpeechDone(speechGen);
+        InitWinrt();
+        SetVoice("", "cozy");
+        EmitVoices();
+        Emit("{\"type\":\"ready\",\"voice\":\"" + Esc(voiceName) + "\",\"culture\":\"" + culture.Name + "\"}");
+
+        if (!string.IsNullOrEmpty(waveFile))
+        {
+            // Testmodus: WAV-Datei in Echtzeit statt Mikrofon, danach beenden (ohne Töne aus den Lautsprechern)
+            debug = true;
+            chimeStyle = "off";
+            var done = new ManualResetEvent(false);
+            rec.RecognizeCompleted += (s, e) => done.Set();
+            rec.SetInputToAudioStream(new RealtimeWave(waveFile),
+                new SpeechAudioFormatInfo(16000, AudioBitsPerSample.Sixteen, AudioChannel.Mono));
+            micOn = true;
+            SetListening(false);
+            rec.RecognizeAsync(RecognizeMode.Multiple);
+            done.WaitOne();
+            Emit("{\"type\":\"done\"}");
+            return;
+        }
+
+        string line;
+        while ((line = Console.In.ReadLine()) != null)
+        {
+            var parts = line.Split(new[] { '\t' }, 2);
+            string cmd = parts[0].Trim();
+            string arg = parts.Length > 1 ? parts[1] : "";
+            try
+            {
+                if (cmd == "mic") { if (arg == "on") MicOn(); else MicOff(); }
+                else if (cmd == "listen") { MicOn(); SetListening(true); PlayChime(); }
+                else if (cmd == "say") Say(arg);
+                else if (cmd == "playwav") PlayFile(arg);
+                else if (cmd == "stopsay")
+                {
+                    int gen = Interlocked.Increment(ref speechGen);
+                    StopAudio();
+                    SpeechDone(gen);
+                }
+                else if (cmd == "threshold") wakeThreshold = double.Parse(arg, CultureInfo.InvariantCulture);
+                else if (cmd == "chime") chimeStyle = arg;
+                else if (cmd == "chimetest") PlayChime(arg);
+                else if (cmd == "voice")
+                {
+                    int sep = arg.LastIndexOf('|');
+                    SetVoice(sep < 0 ? arg : arg.Substring(0, sep), sep < 0 ? "cozy" : arg.Substring(sep + 1));
+                }
+                else if (cmd == "reload")
+                {
+                    if (micOn) { pendingReload = configPath; rec.RequestRecognizerUpdate(); }
+                    else Reload(configPath);
+                }
+                else if (cmd == "quit") break;
+            }
+            catch (Exception ex)
+            {
+                Emit("{\"type\":\"error\",\"message\":\"" + Esc(ex.Message) + "\"}");
+            }
+        }
+        MicOff();
+    }
+}
+
+// Liefert die PCM-Daten einer 16-kHz-Mono-WAV nur so schnell, wie sie echt gesprochen würden (Testmodus)
+public class RealtimeWave : Stream
+{
+    const int BytesPerSecond = 32000;
+    readonly byte[] data;
+    int pos;
+    readonly DateTime start = DateTime.Now;
+
+    public RealtimeWave(string path)
+    {
+        byte[] all = File.ReadAllBytes(path);
+        int i = 12;
+        data = new byte[0];
+        while (i + 8 <= all.Length)
+        {
+            int size = BitConverter.ToInt32(all, i + 4);
+            if (Encoding.ASCII.GetString(all, i, 4) == "data")
+            {
+                data = new byte[Math.Min(size, all.Length - i - 8)];
+                Array.Copy(all, i + 8, data, 0, data.Length);
+                return;
+            }
+            i += 8 + size;
+        }
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        if (pos >= data.Length) return 0;
+        // Immer den ganzen Puffer liefern (kurze Reads wertet die Erkennung als Stream-Ende), nur verzögert
+        int n = Math.Min(count, data.Length - pos);
+        while ((DateTime.Now - start).TotalSeconds * BytesPerSecond < pos + n)
+            Thread.Sleep(10);
+        Array.Copy(data, pos, buffer, offset, n);
+        pos += n;
+        return n;
+    }
+
+    public override bool CanRead { get { return true; } }
+    public override bool CanSeek { get { return true; } }
+    public override bool CanWrite { get { return false; } }
+    public override long Length { get { return data.Length; } }
+    public override long Position { get { return pos; } set { pos = (int)Math.Max(0, Math.Min(value, data.Length)); } }
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        // SAPI fragt nur die aktuelle Position ab
+        Position = origin == SeekOrigin.Begin ? offset : origin == SeekOrigin.Current ? pos + offset : data.Length + offset;
+        return pos;
+    }
+    public override void SetLength(long value) { throw new NotSupportedException(); }
+    public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+}
+"""
+
+# Kompiliert den Host einmal zur DLL (eine Datei pro Quelltext-Version) und startet ihn
+SPEECH_LAUNCHER = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding $false
+try {
+  Add-Type -AssemblyName System.Speech
+  if (-not (Test-Path -LiteralPath $Dll)) {
+    $refs = @(([System.Speech.Recognition.SpeechRecognitionEngine]).Assembly.Location, ([System.Linq.Enumerable]).Assembly.Location)
+    Add-Type -TypeDefinition (Get-Content -Raw -Encoding UTF8 -LiteralPath $Src) -ReferencedAssemblies $refs -Language CSharp -OutputAssembly $Dll -OutputType Library
+  }
+  Add-Type -Path $Dll
+  [NexusSpeech]::Run($Cfg, '')
+} catch {
+  Remove-Item -LiteralPath $Dll -ErrorAction SilentlyContinue
+  [Console]::Out.WriteLine('{"type":"error","message":' + (ConvertTo-Json ([string]$_.Exception.Message)) + '}')
+}
+"""
+
+AI = {"state": "off", "ready": False, "level": 0, "hypothesis": "", "error": None, "voice": None, "voices": [],
+      "speaking": False, "thinking": False, "apps": 0, "targets": 0, "vocab_hash": None}
+AI_PREVIEW_TEXT = "Hi, ich bin NEXUS. So klinge ich jetzt. Gefällt dir das?"
+AI_LOG = deque(maxlen=80)     # Unterhaltung für die UI (nur im Speicher, wird nicht gespeichert)
+AI_EVENTS = deque(maxlen=30)  # UI-Aktionen, z.B. "Ansicht wechseln"
+AI_SEQ = {"n": 0}
+AI_LOCK = threading.Lock()
+AI_THRESHOLDS = {"low": 0.5, "normal": 0.35, "high": 0.25}
+AI_WAKE = ("hey nexus", "hallo nexus", "hi nexus", "okay nexus")
+AI_TIMERS = []
+
+def ai_next_id():
+    with AI_LOCK:
+        AI_SEQ["n"] += 1
+        return AI_SEQ["n"]
+
+def ai_log(role, text, source=None):
+    AI_LOG.append({"id": ai_next_id(), "role": role, "text": text, "source": source,
+                   "time": datetime.now().strftime("%H:%M")})
+
+def ai_event(kind, value):
+    AI_EVENTS.append({"id": ai_next_id(), "type": kind, "value": value})
+
+class SpeechHost:
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+        self.queue = []  # Befehle, die warten, bis der Host bereit ist
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self):
+        with self.lock:
+            if self.running():
+                return
+            os.makedirs(AI_DIR, exist_ok=True)
+            source = SPEECH_HOST_CS.encode("utf-8")
+            src_path = os.path.join(AI_DIR, "speech_host.cs")
+            dll = os.path.join(AI_DIR, f"NexusSpeech_{hashlib.sha1(source).hexdigest()[:10]}.dll")
+            with open(src_path, "wb") as f:
+                f.write(source)
+            for old in glob.glob(os.path.join(AI_DIR, "NexusSpeech_*.dll")):
+                if old != dll:
+                    try:
+                        os.remove(old)
+                    except OSError:
+                        pass  # noch von einem anderen NEXUS-Fenster geladen
+            write_ai_config()
+            script = f"$Src = {ps_quote(src_path)}\n$Dll = {ps_quote(dll)}\n$Cfg = {ps_quote(AI_CONFIG)}\n{SPEECH_LAUNCHER}"
+            encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+            AI.update(state="starting", ready=False, error=None)
+            self.proc = subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+
+    def send(self, *parts):
+        if not self.running():
+            return False
+        line = "\t".join(re.sub(r"[\t\r\n]+", " ", str(p)) for p in parts)
+        try:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def send_or_queue(self, *parts):
+        if AI["ready"]:
+            self.send(*parts)
+        else:
+            # Startet den Host bei Bedarf; ausgeführt wird, sobald er "ready" meldet
+            self.queue.append(parts)
+            self.start()
+
+    def say(self, text):
+        AI["speaking"] = True
+        self.send_or_queue("say", text)
+
+    def stop(self):
+        with self.lock:
+            proc, self.proc = self.proc, None
+        if proc and proc.poll() is None:
+            try:
+                proc.stdin.write("quit\n")
+                proc.stdin.flush()
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+        AI.update(state="off", ready=False, level=0, hypothesis="", speaking=False)
+
+    def _reader(self, proc):
+        for line in proc.stdout:
+            try:
+                evt = json.loads(line)
+            except ValueError:
+                continue
+            try:
+                on_speech_event(evt)
+            except Exception:
+                pass
+        if self.proc is proc:  # abgestürzt statt per stop() beendet
+            self.proc = None
+            AI.update(ready=False, state="error" if AI["error"] else "off", level=0, hypothesis="", speaking=False)
+
+SPEECH = SpeechHost()
+
+def on_speech_event(evt):
+    kind = evt.get("type")
+    if kind == "ready":
+        AI.update(ready=True, voice=evt.get("voice"), error=None, state="off")
+        ai_apply_settings()
+        queued, SPEECH.queue = SPEECH.queue, []
+        for parts in queued:
+            SPEECH.send(*parts)
+    elif kind == "voices":
+        AI["voices"] = evt.get("items") or []
+    elif kind == "voice":
+        AI["voice"] = evt.get("name")
+    elif kind == "state":
+        AI["state"] = evt.get("value", "off")
+        if AI["state"] != "listening":
+            AI["hypothesis"] = ""
+    elif kind == "level":
+        AI["level"] = evt.get("value", 0)
+    elif kind == "hypothesis":
+        AI["hypothesis"] = evt.get("text", "")
+    elif kind == "heard":
+        threading.Thread(target=ai_handle, args=(evt.get("text", ""), "voice"), daemon=True).start()
+        ai_after_listen()
+    elif kind == "rejected":
+        if evt.get("text"):
+            ai_log("system", f"Unsicher verstanden: „{evt['text']}“")
+        ai_reply("Das habe ich nicht verstanden.")
+        ai_after_listen()
+    elif kind == "listen_end":
+        ai_after_listen()
+    elif kind == "speak_end":
+        AI["speaking"] = False
+    elif kind == "error":
+        AI["error"] = evt.get("message") or "Unbekannter Fehler"
+        ai_log("system", AI["error"])
+
+def ai_after_listen():
+    # "Jetzt zuhören" ohne Dauer-Zuhören: Mikrofon nach dem einen Befehl wieder aus
+    if not get_settings()["ai_listen"]:
+        SPEECH.send("mic", "off")
+
+def ai_apply_settings():
+    s = get_settings()
+    if s["ai_listen"] and not SPEECH.running():
+        SPEECH.start()  # meldet sich mit "ready" und landet dann wieder hier
+        return
+    if not AI["ready"]:
+        return
+    SPEECH.send("threshold", AI_THRESHOLDS.get(s["ai_sensitivity"], 0.35))
+    SPEECH.send("chime", s["ai_sound"])
+    # Bei einer Piper-Stimme bleibt im Host die beste Windows-Stimme als Ersatz eingestellt
+    host_voice = "" if s["ai_voice_name"].startswith("piper:") else s["ai_voice_name"].replace("|", "")
+    SPEECH.send("voice", f"{host_voice}|{s['ai_voice_style']}")
+    if s["ai_listen"]:
+        SPEECH.send("mic", "on")
+    elif AI["state"] == "idle":
+        SPEECH.send("mic", "off")
+
+def ai_listen_now():
+    AI["error"] = None
+    SPEECH.send_or_queue("listen")
+    return {"ok": True}
+
+def ai_preview(kind):
+    if kind == "sound":
+        SPEECH.send_or_queue("chimetest", get_settings()["ai_sound"])
+    else:
+        ai_speak(AI_PREVIEW_TEXT)
+    return {"ok": True}
+
+def ai_stop_speaking():
+    PIPER.gen += 1  # noch laufende Piper-Synthese verwerfen
+    SPEECH.send("stopsay")
+    AI["speaking"] = False
+
+# ---------------- Natürliche Stimmen: Piper (neuronal, offline, optional) ----------------
+# Wird erst bei Auswahl einer Piper-Stimme installiert: eigenes venv mit "piper-tts" + Stimmmodell von Hugging Face.
+
+PIPER_DIR = os.path.join(AI_DIR, "piper")
+PIPER_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE"
+PIPER_VOICES = {  # Schlüssel -> (Name, Stimme, Pfad im Repo, Größe in MB)
+    "de_DE-kerstin-low": ("Kerstin", "weiblich", "kerstin/low", 63),
+    "de_DE-ramona-low": ("Ramona", "weiblich", "ramona/low", 63),
+    "de_DE-thorsten-high": ("Thorsten", "männlich", "thorsten/high", 114),
+}
+PIPER_JOB = {"running": False, "voice": None, "message": "", "progress": None, "ok": None}
+PIPER_JOB_LOCK = threading.Lock()
+
+# Läuft im Piper-venv: hält geladene Stimmen im Speicher und schreibt pro Zeile eine WAV-Datei
+PIPER_WORKER = r'''
+import json, sys, wave
+from piper import PiperVoice, SynthesisConfig
+voices = {}
+for line in sys.stdin:
+    job = {}
+    try:
+        job = json.loads(line)
+        if job["model"] not in voices:
+            voices[job["model"]] = PiperVoice.load(job["model"])
+        config = SynthesisConfig(length_scale=job.get("length", 1.0))
+        with wave.open(job["out"], "wb") as w:
+            voices[job["model"]].synthesize_wav(job["text"], w, syn_config=config)
+        print(json.dumps({"id": job["id"], "ok": True}), flush=True)
+    except Exception as e:
+        print(json.dumps({"id": job.get("id"), "ok": False, "error": str(e)}), flush=True)
+'''
+
+def piper_python():
+    return os.path.join(PIPER_DIR, "env", "Scripts", "python.exe")
+
+def piper_model(key):
+    return os.path.join(PIPER_DIR, "voices", key + ".onnx")
+
+def piper_installed(key=None):
+    ok = os.path.exists(piper_python()) and os.path.exists(os.path.join(PIPER_DIR, "env", "Lib", "site-packages", "piper"))
+    return ok and (key is None or (os.path.exists(piper_model(key)) and os.path.exists(piper_model(key) + ".json")))
+
+def piper_status():
+    return {"engine": piper_installed(), "job": dict(PIPER_JOB),
+            "voices": [{"key": k, "name": v[0], "gender": v[1], "size": v[3], "installed": piper_installed(k)}
+                       for k, v in PIPER_VOICES.items()]}
+
+class PiperEngine:
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+        self.gen = 0
+        self.n = 0
+
+    def synth(self, key, text, length):
+        with self.lock:
+            if self.proc is None or self.proc.poll() is not None:
+                worker = os.path.join(PIPER_DIR, "worker.py")
+                with open(worker, "w", encoding="utf-8") as f:
+                    f.write(PIPER_WORKER)
+                self.proc = subprocess.Popen([piper_python(), "-u", worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                             errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
+            self.n += 1
+            # Zwei Dateien im Wechsel: der Host liest die vorige noch, während die nächste entsteht
+            out = os.path.join(PIPER_DIR, f"say_{self.n % 2}.wav")
+            self.proc.stdin.write(json.dumps({"id": self.n, "model": piper_model(key), "text": text,
+                                              "length": length, "out": out}) + "\n")
+            self.proc.stdin.flush()
+            while True:
+                line = self.proc.stdout.readline()
+                if not line:
+                    self.proc = None
+                    raise RuntimeError("Piper wurde beendet")
+                if line.startswith("{"):
+                    res = json.loads(line)
+                    if res.get("id") == self.n:
+                        if not res.get("ok"):
+                            raise RuntimeError(res.get("error") or "Piper-Fehler")
+                        return out
+
+PIPER = PiperEngine()
+
+def install_piper_voice(key):
+    if key not in PIPER_VOICES:
+        raise ValueError("Unbekannte Stimme")
+    with PIPER_JOB_LOCK:
+        if PIPER_JOB["running"]:
+            raise ValueError("Es wird schon eine Stimme geladen")
+        PIPER_JOB.update(running=True, voice=key, message="Vorbereitung …", progress=None, ok=None)
+
+    def worker():
+        name = PIPER_VOICES[key][0]
+        try:
+            os.makedirs(os.path.join(PIPER_DIR, "voices"), exist_ok=True)
+            if not piper_installed():
+                if getattr(sys, "frozen", False):
+                    raise RuntimeError("Natürliche Stimmen brauchen die Python-Version von NEXUS")
+                base = os.path.join(os.path.dirname(sys.executable), "python.exe")
+                base = base if os.path.exists(base) else sys.executable  # pythonw.exe -> python.exe
+                PIPER_JOB["message"] = "Sprach-Engine wird eingerichtet (einmalig, ca. 30 MB) …"
+                for args in ([base, "-m", "venv", os.path.join(PIPER_DIR, "env")],
+                             [piper_python(), "-m", "pip", "install", "--disable-pip-version-check", "-q", "piper-tts"]):
+                    res = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                         creationflags=subprocess.CREATE_NO_WINDOW, timeout=900)
+                    if res.returncode != 0:
+                        raise RuntimeError((res.stderr or res.stdout).strip().splitlines()[-1] if (res.stderr or res.stdout).strip() else "Installation fehlgeschlagen")
+            path = PIPER_VOICES[key][2]
+            for ext in (".onnx.json", ".onnx"):
+                target = piper_model(key) + ext[5:]
+                if os.path.exists(target):
+                    continue
+                PIPER_JOB["message"] = f"{name} wird geladen …"
+                req = urllib.request.Request(f"{PIPER_BASE_URL}/{path}/{key}{ext}", headers={"User-Agent": "NexusOS"})
+                with urllib.request.urlopen(req, timeout=60) as resp, open(target + ".part", "wb") as f:
+                    total, done = int(resp.headers.get("Content-Length") or 0), 0
+                    while True:
+                        chunk = resp.read(262144)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            PIPER_JOB["progress"] = round(done * 100 / total, 1)
+                os.replace(target + ".part", target)
+            PIPER_JOB.update(ok=True, progress=100, message=f"{name} ist bereit")
+            if get_settings()["ai_voice_name"] == "piper:" + key:
+                ai_speak(AI_PREVIEW_TEXT)
+        except Exception as e:
+            PIPER_JOB.update(ok=False, message=f"{name} konnte nicht geladen werden: {e}")
+        PIPER_JOB.update(running=False)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return dict(PIPER_JOB)
+
+def ai_speak(text):
+    """Spricht mit der gewählten Stimme: Piper (natürlich), sonst Windows-Stimme über den Sprach-Host."""
+    s = get_settings()
+    key = s["ai_voice_name"][6:] if s["ai_voice_name"].startswith("piper:") else None
+    if not key or not piper_installed(key):
+        SPEECH.say(text)
+        return
+    AI["speaking"] = True
+    PIPER.gen += 1
+    gen = PIPER.gen
+    length = {"cozy": 1.1, "normal": 1.0, "lively": 0.92}.get(s["ai_voice_style"], 1.0)
+    # Uhrzeiten so schreiben, wie man sie sagt: "19:42 Uhr" -> "19 Uhr 42"
+    text = re.sub(r"\b(\d{1,2}):(\d{2}) Uhr", lambda m: f"{int(m.group(1))} Uhr {int(m.group(2)) or ''}".strip(), text)
+
+    def run():
+        try:
+            out = PIPER.synth(key, text, length)
+            if gen == PIPER.gen:  # inzwischen keine neuere Antwort oder "stopp"
+                SPEECH.send_or_queue("playwav", out)
+            else:
+                AI["speaking"] = False
+        except Exception as e:
+            ai_log("system", f"Natürliche Stimme fehlgeschlagen ({e}), ich nehme die Windows-Stimme.")
+            SPEECH.say(text)
+
+    threading.Thread(target=run, daemon=True).start()
+
+# ---------------- Wortschatz: Apps, Webseiten, Ordner, NEXUS-Ansichten ----------------
+
+AI_BUILTINS = [
+    (("rechner", "taschenrechner"), "Rechner", "uri", "calculator:"),
+    (("editor", "notepad", "texteditor"), "Editor", "exe", r"System32\notepad.exe"),
+    (("explorer", "datei explorer", "dateiexplorer", "dieser pc"), "Explorer", "uri", "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"),
+    (("einstellungen", "windows einstellungen"), "Windows-Einstellungen", "uri", "ms-settings:"),
+    (("task manager", "taskmanager"), "Task-Manager", "exe", r"System32\Taskmgr.exe"),
+    (("paint",), "Paint", "uri", "ms-paint:"),
+    (("systemsteuerung",), "Systemsteuerung", "exe", r"System32\control.exe"),
+    (("eingabeaufforderung", "kommandozeile"), "Eingabeaufforderung", "exe", r"System32\cmd.exe"),
+    (("powershell",), "PowerShell", "exe", r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+    (("kamera",), "Kamera", "uri", "microsoft.windows.camera:"),
+    (("fotos",), "Fotos", "uri", "ms-photos:"),
+    (("uhr", "wecker"), "Uhr", "uri", "ms-clock:"),
+    (("store", "microsoft store"), "Microsoft Store", "uri", "ms-windows-store:"),
+    (("wlan", "wlan einstellungen"), "WLAN-Einstellungen", "uri", "ms-settings:network-wifi"),
+    (("bluetooth", "bluetooth einstellungen"), "Bluetooth", "uri", "ms-settings:bluetooth"),
+    (("sound einstellungen", "toneinstellungen"), "Sound-Einstellungen", "uri", "ms-settings:sound"),
+    (("anzeige einstellungen", "bildschirm einstellungen"), "Anzeige-Einstellungen", "uri", "ms-settings:display"),
+    (("windows update", "updates"), "Windows Update", "uri", "ms-settings:windowsupdate"),
+    (("papierkorb",), "Papierkorb", "uri", "shell:RecycleBinFolder"),
+    (("snipping tool",), "Snipping Tool", "uri", "ms-screenclip:"),
+    (("downloads", "download ordner", "downloadordner"), "Downloads", "place", "downloads"),
+    (("dokumente", "dokumenten ordner"), "Dokumente", "place", "documents"),
+    (("bilder", "bilder ordner"), "Bilder", "place", "pictures"),
+    (("desktop", "schreibtisch"), "Desktop", "place", "desktop"),
+    (("musik", "musik ordner"), "Musik", "path", "~/Music"),
+    (("videos", "video ordner"), "Videos", "path", "~/Videos"),
+]
+AI_WEBSITES = [
+    (("youtube",), "YouTube", "https://www.youtube.com"),
+    (("netflix",), "Netflix", "https://www.netflix.com"),
+    (("twitch",), "Twitch", "https://www.twitch.tv"),
+    (("reddit",), "Reddit", "https://www.reddit.com"),
+    (("google",), "Google", "https://www.google.com"),
+    (("gmail", "google mail"), "Gmail", "https://mail.google.com"),
+    (("github",), "GitHub", "https://github.com"),
+    (("amazon",), "Amazon", "https://www.amazon.de"),
+    (("instagram",), "Instagram", "https://www.instagram.com"),
+    (("tiktok",), "TikTok", "https://www.tiktok.com"),
+    (("twitter", "x"), "X", "https://x.com"),
+    (("whatsapp", "whatsapp web"), "WhatsApp Web", "https://web.whatsapp.com"),
+    (("chatgpt",), "ChatGPT", "https://chatgpt.com"),
+    (("wikipedia",), "Wikipedia", "https://de.wikipedia.org"),
+    (("spotify", "spotify web"), "Spotify Web", "https://open.spotify.com"),
+    (("google maps", "maps", "karte"), "Google Maps", "https://maps.google.com"),
+    (("übersetzer", "google übersetzer"), "Google Übersetzer", "https://translate.google.com"),
+    (("wetter",), "Wetter", "https://www.google.com/search?q=wetter"),
+]
+AI_VIEWS = [
+    (("dashboard", "übersicht"), "das Dashboard", "view-dash"),
+    (("spoofer", "identity spoofer"), "den Spoofer", "view-spoof"),
+    (("file sorter", "dateisortierer"), "den File Sorter", "view-files"),
+    (("power", "ruhezustand"), "Power & Ruhezustand", "view-power"),
+    (("cleaner", "booster"), "den Cleaner", "view-clean"),
+    (("tweaks", "gaming tweaks"), "die Tweaks", "view-tweaks"),
+    (("netzwerk", "netzwerk scan", "port scan", "ping monitor"), "den Netzwerk-Scan", "view-netscan"),
+    (("toolkit", "tools"), "das Toolkit", "view-tools"),
+    (("alltag", "notizen", "erinnerungen"), "Alltag & Automatik", "view-daily"),
+    (("befehle", "custom commands"), "die Custom Commands", "view-cmds"),
+    (("automationen",), "die Automationen", "view-auto"),
+    (("konverter", "converter", "file converter", "dateikonverter"), "den File Converter", "view-convert"),
+    (("nexus einstellungen",), "die NEXUS-Einstellungen", "view-settings"),
+    (("nexus ai", "assistent"), "NEXUS AI", "view-ai"),
+]
+# So spricht man englische App-Namen auf Deutsch aus – zusätzliche Schreibweisen für die Erkennung
+AI_SOUNDS_LIKE = {
+    "discord": ["diskord"], "steam": ["stiem"], "spotify": ["spotifai"], "chrome": ["krom"],
+    "google chrome": ["gugel krom"], "firefox": ["feierfox"], "edge": ["etsch"], "whatsapp": ["wotsap"],
+    "teams": ["tiems"], "outlook": ["autluk"], "excel": ["exel"], "powerpoint": ["pauerpoint"],
+    "minecraft": ["meinkraft"], "valorant": ["walorant"], "fortnite": ["fortneit"], "epic games": ["epik games"],
+    "obs studio": ["o b s studio"], "obs": ["o b s"], "visual studio code": ["vs code", "v s code"],
+    "photoshop": ["fotoschop"], "notion": ["nouschen"], "slack": ["släck"], "vlc media player": ["v l c"],
+    "telegram": ["telegramm"], "youtube": ["jutjub"], "twitch": ["twitsch"], "riot client": ["reiot client"],
+    "league of legends": ["lieg of legends"], "battle net": ["battlenet"], "gmail": ["dschimeil"],
+}
+AI_APP_SKIP = re.compile(r"uninstall|deinstall|readme|read me|hilfe|\bhelp\b|handbuch|manual|dokumentation|documentation|"
+                         r"release notes|website|support|license|lizenz|changelog|neuigkeiten|feedback|safe mode|"
+                         r"abgesichert|debug|repair|reparier|setup|einrichtung", re.I)
+AI_VENDORS = {"microsoft", "google", "mozilla", "adobe", "nvidia", "amd", "intel", "valve", "logitech", "razer",
+              "steelseries", "corsair", "asus", "msi", "jetbrains", "oracle", "apple", "ubisoft", "ea"}
+AI_GENERIC_TAIL = {"app", "client", "launcher", "desktop"}
+AI_TARGETS = {}  # gesprochener Name -> {"label", "kind", "value"}
+AI_TARGET_LOCK = threading.Lock()
+AI_APPS = {"items": [], "scanned": 0.0}
+
+def ai_spoken(name):
+    n = str(name).lower()
+    n = re.sub(r"\(.*?\)|\[.*?\]|[®™©]", " ", n)
+    n = n.replace("&", " und ").replace("+", " plus ")
+    n = re.sub(r"[^a-zäöüß0-9]+", " ", n)
+    n = re.sub(r"\b(x64|x86|64 bit|32 bit)\b", " ", n)
+    n = re.sub(r"(\s\d+)+$", "", " " + n.strip())  # Versionsnummern am Ende ("blender 4 2" -> "blender")
+    return re.sub(r"\s+", " ", n).strip()
+
+def ai_aliases(spoken):
+    words = spoken.split()
+    out = [spoken]
+    if len(words) > 1 and words[0] in AI_VENDORS:
+        out.append(" ".join(words[1:]))  # "google chrome" -> "chrome"
+    if len(words) > 1 and words[-1] in AI_GENERIC_TAIL:
+        out.append(" ".join(words[:-1]))  # "riot client" -> "riot"
+    for alias in list(out):
+        out += AI_SOUNDS_LIKE.get(alias, [])
+    return [a for a in dict.fromkeys(out) if 1 <= len(a) <= 40 and len(a.split()) <= 5]
+
+def rebuild_ai_targets():
+    targets = {}
+
+    def add(names, label, kind, value):
+        for name in names:
+            for alias in ai_aliases(name):
+                targets[alias] = {"label": label, "kind": kind, "value": value}
+
+    for names, label, kind, value in AI_BUILTINS:
+        add(names, label, kind, value)
+    for names, label, url in AI_WEBSITES:
+        add(names, label, "url", url)
+    for app in AI_APPS["items"]:  # installierte Apps schlagen gleichnamige Webseiten
+        spoken = ai_spoken(app["name"])
+        if spoken:
+            add([spoken], re.sub(r"\s*\(.*?\)", "", app["name"]).strip() or app["name"], "app", app["id"])
+    for names, label, view in AI_VIEWS:
+        add(names, label, "view", view)
+    with AI_TARGET_LOCK:
+        AI_TARGETS.clear()
+        AI_TARGETS.update(targets)
+    AI.update(targets=len(targets), apps=len(AI_APPS["items"]))
+
+def scan_start_apps():
+    script = ("[Console]::OutputEncoding = New-Object Text.UTF8Encoding $false\n"
+              "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress")
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        res = subprocess.run(["powershell", "-NoProfile", "-EncodedCommand", encoded],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             creationflags=subprocess.CREATE_NO_WINDOW, timeout=60)
+        data = json.loads(res.stdout.strip().lstrip("﻿") or "[]")
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return
+    if isinstance(data, dict):
+        data = [data]
+    AI_APPS["items"] = [{"name": a["Name"], "id": a["AppID"]} for a in data
+                        if a.get("Name") and a.get("AppID") and not AI_APP_SKIP.search(a["Name"])]
+    AI_APPS["scanned"] = time.time()
+    rebuild_ai_targets()
+
+rebuild_ai_targets()
+
+def _german_number(n):
+    ones = ["null", "eins", "zwei", "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun", "zehn", "elf", "zwölf",
+            "dreizehn", "vierzehn", "fünfzehn", "sechzehn", "siebzehn", "achtzehn", "neunzehn"]
+    tens = {20: "zwanzig", 30: "dreißig", 40: "vierzig", 50: "fünfzig", 60: "sechzig", 70: "siebzig",
+            80: "achtzig", 90: "neunzig"}
+    if n < 20:
+        return ones[n]
+    if n < 100:
+        unit = n % 10
+        return tens[n - unit] if not unit else ("ein" if unit == 1 else ones[unit]) + "und" + tens[n - unit]
+    return "hundert" + (_german_number(n - 100) if n > 100 else "")
+
+AI_NUMBERS = {_german_number(n): n for n in range(1, 121)}
+AI_NUMBERS.update({"einhundert": 100, "dreissig": 30})
+AI_ARTICLES = {"ein": 1, "eine": 1, "einer": 1, "einen": 1}
+
+AI_FIXED = (
+    "wie spät ist es", "wie viel uhr ist es", "wie viel uhr haben wir", "uhrzeit",
+    "welcher tag ist heute", "welches datum ist heute", "der wievielte ist heute",
+    "systemstatus", "wie geht es meinem pc", "wie geht es dem pc",
+    "lauter", "mach lauter", "viel lauter", "leiser", "mach leiser", "viel leiser",
+    "ton aus", "ton an", "stummschalten", "stummschaltung aufheben",
+    "nächstes lied", "nächster song", "vorheriges lied", "letztes lied", "pause", "musik pause",
+    "weiter", "weiterspielen", "musik an", "musik aus",
+    "sperre den pc", "pc sperren", "bildschirm sperren",
+    "mach einen speedtest", "speedtest", "wie schnell ist mein internet",
+    "sortiere die downloads", "sortiere meine downloads", "räum die downloads auf",
+    "caffeine an", "caffeine aus", "bleib wach",
+    "leere den temp ordner", "räum den pc auf",
+    "mach einen screenshot", "screenshot",
+    "welche erinnerungen habe ich", "was steht an",
+    "danke", "dankeschön", "vielen dank", "abbrechen", "stopp", "vergiss es", "nichts",
+    "was kannst du", "hilfe", "wer bist du", "wie geht es dir", "apps neu einlesen",
+)
+
+def ai_vocab():
+    # Nur Buchstaben: Ziffern oder Sonderzeichen in einem einzigen Namen können die ganze Grammatik kippen
+    clean = lambda items: sorted({n for n in items if n and re.fullmatch(r"[a-zäöüß ]+", n)})
+    with AI_TARGET_LOCK:
+        targets = clean(AI_TARGETS)
+    with DATA_LOCK:
+        workspaces = clean(ai_spoken(w["name"]) for w in USER_DATA["workspaces"])
+        commands = clean(ai_spoken(c["name"]) for c in USER_DATA["commands"])
+    nums = list(AI_NUMBERS) + list(AI_ARTICLES)
+    lines = ([f"wake|{w}" for w in AI_WAKE] + [f"target|{t}" for t in targets[:900]]
+             + [f"ws|{w}" for w in workspaces] + [f"cmd|{c}" for c in commands]
+             + [f"num|{n}" for n in nums] + [f"fixed|{p}" for p in AI_FIXED])
+    return "\n".join(lines)
+
+def write_ai_config():
+    text = ai_vocab()
+    os.makedirs(AI_DIR, exist_ok=True)
+    with open(AI_CONFIG, "w", encoding="utf-8") as f:
+        f.write(text)
+    AI["vocab_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+def ai_loop():
+    scan_start_apps()
+    ai_apply_settings()  # hört wieder zu, wenn es beim letzten Mal an war
+    # Natürliche Stimme vorladen: der allererste Satz bräuchte sonst ~5 s statt 0,2 s
+    voice = get_settings()["ai_voice_name"]
+    if voice.startswith("piper:") and piper_installed(voice[6:]):
+        try:
+            PIPER.synth(voice[6:], "Hallo.", 1.0)
+        except Exception:
+            pass
+    while True:
+        time.sleep(15)
+        try:
+            if time.time() - AI_APPS["scanned"] > 900:
+                scan_start_apps()
+            # Neue Workspaces, Befehle oder Apps ohne Neustart in die Erkennung übernehmen
+            if AI["ready"] and hashlib.sha1(ai_vocab().encode("utf-8")).hexdigest() != AI["vocab_hash"]:
+                write_ai_config()
+                SPEECH.send("reload")
+        except Exception:
+            pass
+
+# ---------------- Befehle verstehen und ausführen ----------------
+
+DAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+MONTHS_DE = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September",
+             "Oktober", "November", "Dezember"]
+AI_FILLERS = {"bitte", "mal", "doch", "danke", "gerne", "jetzt", "kurz", "einfach", "schnell", "noch"}
+AI_OPEN_RE = re.compile(r"^(?:kannst du |könntest du )?(?:öffne\w*|starte?\w*|zeig\w*|mach\w*|geh\w* (?:auf|zu)|ruf\w*|lade|launch|open)"
+                        r"\s+(?:mir\s+)?(?:auf\s+|zu\s+)?(.+?)(?:\s+(?:auf|an|öffnen|starten))*$")
+AI_OPEN_RE2 = re.compile(r"^(?:kannst du |könntest du )?(?:mir )?(.+?) (?:öffnen|starten|aufmachen|anmachen)$")
+VK_KEYS = {"up": 0xAF, "down": 0xAE, "mute": 0xAD, "next": 0xB0, "prev": 0xB1, "playpause": 0xB3}
+AI_HELP = ("Ich kann Apps, Ordner und Webseiten öffnen, Erinnerungen und Timer stellen, im Web und auf YouTube suchen, "
+           "Musik und Lautstärke steuern, Workspaces und deine Befehle starten, die Uhrzeit sagen, einen Speedtest "
+           "machen, Downloads sortieren und den PC sperren. Sag zum Beispiel: Hey Nexus, öffne Spotify.")
+
+def ai_plain(text, keep_case=False):
+    t = str(text or "") if keep_case else str(text or "").lower()
+    t = re.sub(r"[„“”\"'!?,;()«»]", " ", t)
+    t = re.sub(r"(?<!\d)\.|\.(?!\d)", " ", t)  # Satzpunkte weg, "18.30" bleibt
+    t = re.sub(r"\s+", " ", t).strip()
+    return re.sub(r"^(?:hey|hallo|hi|okay|ok) nexus\b\s*", "", t, flags=re.I)  # getippt mit Wakeword
+
+def ai_normalize(text, keep_case=False):
+    t = ai_plain(text, keep_case)
+    t = re.sub(r"\b(?:einer |eine )?halben? stunde\b", "30 minuten", t, flags=re.I)
+    t = re.sub(r"\b(?:einer |eine )?viertelstunde\b", "15 minuten", t, flags=re.I)
+    t = re.sub(r"\banderthalb stunden\b", "90 minuten", t, flags=re.I)
+    t = re.sub(r"\b(?:ein|eine|einer|einen)\s+(sekunde|minute|stunde)\b", r"1 \1", t, flags=re.I)
+    return " ".join(str(AI_NUMBERS[w.lower()]) if w.lower() in AI_NUMBERS else w for w in t.split())
+
+def ai_seconds(n, unit):
+    return n * (1 if unit.startswith("sek") else 60 if unit.startswith("min") else 3600)
+
+def ai_duration(secs):
+    h, rest = divmod(int(secs), 3600)
+    m, s = divmod(rest, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} Stunde{'' if h == 1 else 'n'}")
+    if m:
+        parts.append(f"{m} Minute{'' if m == 1 else 'n'}")
+    if s and not h:
+        parts.append(f"{s} Sekunde{'' if s == 1 else 'n'}")
+    return " und ".join(parts) or "0 Sekunden"
+
+def press_key(vk, times=1):
+    for _ in range(times):
+        ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(vk, 0, 2, 0)  # KEYEVENTF_KEYUP
+        time.sleep(0.01)
+
+def ai_find_target(name, loose=True):
+    name = re.sub(r"^(?:den|die|das|meine|meinen|mein|mir)\s+", "", name.strip())
+    name = re.sub(r"\s+(?:auf|an|bitte|app|programm|für mich)$", "", name)
+    with AI_TARGET_LOCK:
+        if name in AI_TARGETS:
+            return AI_TARGETS[name]
+        keys = list(AI_TARGETS)
+    match = difflib.get_close_matches(name, keys, n=1, cutoff=0.78 if loose else 0.88)
+    if match:
+        return AI_TARGETS[match[0]]
+    if not loose:
+        return None
+    # "obs" -> "obs studio", solange der Anfang eindeutig ist
+    starts = {AI_TARGETS[k]["label"]: k for k in keys if k.startswith(name + " ")}
+    if len(starts) == 1:
+        return AI_TARGETS[next(iter(starts.values()))]
+    # "den google chrome browser" enthält einen bekannten Namen
+    hits = [k for k in keys if len(k) >= 4 and re.search(rf"\b{re.escape(k)}\b", name)]
+    return AI_TARGETS[max(hits, key=len)] if hits else None
+
+def ai_open(target):
+    kind, value = target["kind"], target["value"]
+    # Alles über explorer.exe: startet mit normalen Rechten statt mit unseren Admin-Rechten
+    if kind == "view":
+        ai_event("view", value)
+        return f"Ich zeige dir {target['label']}."
+    if kind == "app":
+        subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{value}"])
+    elif kind == "url":
+        open_url(value)
+    elif kind == "place":
+        open_known_place(value)
+    elif kind == "path":
+        subprocess.Popen(["explorer.exe", os.path.expanduser(value)])
+    elif kind == "exe":
+        subprocess.Popen(["explorer.exe", os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), value)])
+    else:
+        subprocess.Popen(["explorer.exe", value])
+    return f"Ich öffne {target['label']}."
+
+def ai_find_named(name, items):
+    by_name = {ai_spoken(i["name"]): i for i in items}
+    if name in by_name:
+        return by_name[name]
+    match = difflib.get_close_matches(name, list(by_name), n=1, cutoff=0.7)
+    return by_name[match[0]] if match else None
+
+def ai_start_timer(secs, label):
+    entry = {"label": label, "due": time.time() + secs}
+
+    def fire():
+        if entry in AI_TIMERS:
+            AI_TIMERS.remove(entry)
+        show_popup(f"Dein Timer ({label}) ist abgelaufen.", "NEXUS Timer")
+        ai_reply(f"Dein Timer über {label} ist abgelaufen.")
+
+    timer = threading.Timer(secs, fire)
+    timer.daemon = True
+    timer.start()
+    AI_TIMERS.append(entry)
+
+def ai_reminder(t):
+    # t behält die Groß-/Kleinschreibung, damit der Erinnerungstext so bleibt, wie gesagt
+    m = re.match(r"^(?:bitte )?erinner\w* mich in (\d+) (sekunden?|minuten?|stunden?)\b(?: (?:an|daran|dass|das))?\s*(.*)$", t, re.I)
+    if m:
+        secs = ai_seconds(int(m.group(1)), m.group(2).lower())
+        what = m.group(3).strip() or "Erinnerung"
+        if secs < 60:
+            ai_start_timer(secs, what)
+        else:
+            add_reminder({"text": what[:1].upper() + what[1:], "minutes": max(1, round(secs / 60))})
+        return f"Okay, ich erinnere dich in {ai_duration(secs)} an {what}."
+    m = re.match(r"^(?:bitte )?erinner\w* mich um (\d{1,2})(?:[:.](\d{2})| uhr(?: (\d{1,2}))?)?(?: uhr)?\b(?: (?:an|daran|dass|das))?\s*(.*)$", t, re.I)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or m.group(3) or 0)
+        if hour > 23 or minute > 59:
+            return "Diese Uhrzeit gibt es nicht."
+        now = datetime.now()
+        # "um 6" am Nachmittag meint meistens 18 Uhr
+        if hour < 12 and (hour, minute) <= (now.hour, now.minute) < (hour + 12, minute):
+            hour += 12
+        what = m.group(4).strip() or "Erinnerung"
+        add_reminder({"text": what[:1].upper() + what[1:], "mode": "at", "time": f"{hour:02d}:{minute:02d}"})
+        return f"Okay, ich erinnere dich um {hour}:{minute:02d} Uhr an {what}."
+    if t.lower().startswith(("erinner", "bitte erinner")):
+        return "Sag zum Beispiel: Erinnere mich in zehn Minuten an die Wäsche."
+    return None
+
+def ai_list_reminders():
+    with DATA_LOCK:
+        upcoming = USER_DATA["reminders"][:3]
+    if not upcoming:
+        return "Du hast keine Erinnerungen."
+    items = [f"{datetime.fromtimestamp(r['due']):%H:%M} Uhr {r['text']}" for r in upcoming]
+    return "Als Nächstes: " + ", ".join(items) + "."
+
+def ai_status_reply():
+    cpu = MONITOR["cpu"][-1] if MONITOR["cpu"] else 0
+    mem, disk = get_memory_info(), get_disk_info()
+    reply = (f"Der Prozessor ist zu {round(cpu)} % ausgelastet, der Arbeitsspeicher zu {mem['percent']} %. "
+             f"Auf C sind noch {round(disk['free_gb'])} GB frei.")
+    if GPU_STATE["util"] is not None and time.time() - GPU_STATE["ts"] < 30:
+        reply += f" Die Grafikkarte liegt bei {round(GPU_STATE['util'])} %"
+        reply += f" und {round(GPU_STATE['temp'])} °C." if GPU_STATE["temp"] is not None else "."
+    return reply
+
+def ai_speedtest():
+    try:
+        start_speedtest()
+    except ValueError:
+        return "Der Speedtest läuft schon."
+
+    def report():
+        while SPEEDTEST["running"]:
+            time.sleep(1)
+        if SPEEDTEST["error"]:
+            ai_reply(f"Der Speedtest ist fehlgeschlagen: {SPEEDTEST['error']}")
+        else:
+            ai_reply(f"Speedtest fertig: {round(SPEEDTEST['down'] or 0)} Mbit/s Download, "
+                     f"{round(SPEEDTEST['up'] or 0)} Mbit/s Upload, Ping {round(SPEEDTEST['ping'] or 0)} ms.")
+
+    threading.Thread(target=report, daemon=True).start()
+    return "Ich messe dein Internet, das dauert etwa 20 Sekunden."
+
+def ai_rules(text):
+    """Feste Befehle. Gibt die Antwort zurück oder None, wenn nichts passt."""
+    plain = ai_plain(text)
+    t = ai_normalize(text)
+    core = " ".join(w for w in t.split() if w not in AI_FILLERS)
+    if not plain:
+        return None
+
+    # Smalltalk & Steuerung
+    if plain in ("danke", "danke dir", "dankeschön", "danke schön", "vielen dank", "merci", "super danke", "top danke"):
+        return random.choice(["Gern geschehen!", "Immer gerne.", "Kein Problem."])
+    if core in ("abbrechen", "stopp", "stop", "nichts", "vergiss es", "egal", "schon gut", "halt", "ruhe"):
+        ai_stop_speaking()
+        return "Okay."
+    if re.fullmatch(r"was kannst du(?: alles)?|hilfe|was kann ich (?:dich )?fragen|wie funktionierst du", core):
+        return AI_HELP
+    if re.fullmatch(r"wer bist du|was bist du|wie heißt du", core):
+        return "Ich bin NEXUS, dein Assistent. Ich laufe komplett lokal auf deinem PC."
+    if core in ("hallo", "hi", "servus", "moin", "guten morgen", "guten tag", "guten abend", ""):
+        return "Hi! Was kann ich für dich tun?"
+    if re.fullmatch(r"(?:apps|programme) (?:neu )?(?:einlesen|scannen|laden|aktualisieren)", core):
+        scan_start_apps()
+        return f"Fertig, ich kenne jetzt {AI['apps']} Apps."
+
+    # Erinnerungen & Timer
+    if t.startswith(("erinner", "bitte erinner")):
+        return ai_reminder(ai_normalize(text, keep_case=True))
+    m = re.search(r"\btimer (?:auf |für |von |über )?(\d+) (sekunden?|minuten?|stunden?)\b", t) or \
+        re.search(r"\b(\d+) (sekunden?|minuten?|stunden?)[ -]?timer\b", t)
+    if m:
+        secs = ai_seconds(int(m.group(1)), m.group(2))
+        if not 1 <= secs <= 86400:
+            return "Timer gehen von einer Sekunde bis 24 Stunden."
+        ai_start_timer(secs, ai_duration(secs))
+        return f"Timer läuft: {ai_duration(secs)}."
+    if re.search(r"\b(?:welche|meine) erinnerungen\b|^was steht an$|\bhabe ich (?:heute )?(?:noch )?termine\b", core):
+        return ai_list_reminders()
+
+    # Uhrzeit, Datum, Systemstatus
+    now = datetime.now()
+    if re.search(r"\bwie ?(?:spät|viel uhr)\b|\buhrzeit\b|\bwieviel uhr\b", t):
+        return f"Es ist {now.hour}:{now.minute:02d} Uhr."
+    if re.search(r"\bwelche[rsn]? (?:tag|datum)\b|\bder wievielte\b|\bwelches datum\b|^datum$", t):
+        return f"Heute ist {DAYS_DE[now.weekday()]}, der {now.day}. {MONTHS_DE[now.month - 1]} {now.year}."
+    if re.search(r"\bsystem ?status\b|\bwie geht(?: ?s| es) (?:dem|meinem) (?:pc|computer|rechner)\b|\bauslastung\b|^(?:cpu|ram|arbeitsspeicher|prozessor)$", t):
+        return ai_status_reply()
+    if re.fullmatch(r"wie geht(?: ?s| es)(?: dir)?|alles gut|na du", core):
+        return "Mir geht's super, danke! Was steht an?"
+
+    # Lautstärke & Medien
+    m = re.search(r"\blautstärke (?:auf )?(\d+)", t)
+    if m:
+        level = min(100, int(m.group(1)))
+        press_key(VK_KEYS["down"], 50)
+        press_key(VK_KEYS["up"], round(level / 2))
+        return f"Lautstärke steht auf {level} %."
+    m = re.fullmatch(r"(?:mach |dreh |stell )?(?:den ton |die musik |die lautstärke |es )?(etwas |ein bisschen |viel |deutlich )?(lauter|leiser|laute|leise)(?: machen| drehen| stellen)?", core)
+    if m:
+        steps = 10 if m.group(1) in ("viel ", "deutlich ") else 3 if m.group(1) else 5
+        press_key(VK_KEYS["up" if m.group(2).startswith("laut") else "down"], steps)
+        return "Lauter." if m.group(2).startswith("laut") else "Leiser."
+    if re.fullmatch(r"(?:mach |schalt\w* )?(?:den )?(?:ton|sound) (?:aus|ab|an|wieder an)|stumm|stummschalten|stummschaltung aufheben|mute|unmute", core):
+        press_key(VK_KEYS["mute"])
+        return "Erledigt."
+    if re.fullmatch(r"(?:spiel\w* )?(?:das |den )?(?:nächste[snr]?|next) ?(?:lied|song|titel|track)?|überspring\w*(?: das lied| den song)?|skip", core):
+        press_key(VK_KEYS["next"])
+        return "Nächster Titel."
+    if re.fullmatch(r"(?:spiel\w* )?(?:das |den )?(?:vorherige[snr]?|letzte[snr]?) (?:lied|song|titel|track)", core):
+        press_key(VK_KEYS["prev"])
+        return "Vorheriger Titel."
+    if re.fullmatch(r"pause|pausier\w*|play|abspielen|weiter|weiterspielen|fortsetzen|musik (?:an|aus|pause|stopp|weiter)|stopp? die musik|spiel\w* weiter|mach (?:die musik )?(?:pause|weiter)", core):
+        press_key(VK_KEYS["playpause"])
+        return "Okay."
+
+    # System-Aktionen
+    if re.search(r"\b(?:sperr\w*) (?:den |meinen )?(?:pc|computer|rechner|bildschirm)\b|\b(?:pc|bildschirm|computer) sperren\b", t):
+        threading.Timer(1.8, ctypes.windll.user32.LockWorkStation).start()
+        return "Ich sperre den PC."
+    if re.search(r"\bspeed ?test\b|\binternet ?geschwindigkeit\b|\bwie schnell ist (?:mein|das) internet\b", t):
+        return ai_speedtest()
+    if re.search(r"\b(?:sortier\w*|räum\w*) (?:die |meine )?downloads\b|\bdownloads (?:sortieren|aufräumen)\b", t):
+        res = scan_or_sort_folder("downloads", dry_run=False, min_age=120)
+        moved = res.get("moved", 0)
+        return f"Erledigt, {moved} Datei{'' if moved == 1 else 'en'} sortiert." if moved else "Deine Downloads sind schon ordentlich."
+    if re.search(r"\b(?:caffeine|koffein)\b|\bbleib wach\b|\bwach bleiben\b|\bnicht einschlafen\b", t):
+        on = not re.search(r"\b(?:aus|ausschalten|beenden|stopp)\b", t)
+        toggle_caffeine_mode(on)
+        return "Caffeine ist an, der PC bleibt wach." if on else "Caffeine ist aus."
+    if re.search(r"\b(?:leer\w*|lösch\w*|bereinig\w*|räum\w*)\b.*\b(?:temp|temporäre)\b|"
+                 r"\b(?:temp|temporäre dateien)\b.*\b(?:leer\w*|lösch\w*|aufräumen|bereinig\w*)\b|"
+                 r"\b(?:bereinig\w*|räum\w*) den pc\b", t):
+        res = run_system_cleaner(["user_temp"])
+        return f"Erledigt, {res['freed_mb']} MB temporäre Dateien gelöscht."
+    if re.search(r"\bscreenshot\b|\bbildschirmfoto\b", t):
+        subprocess.Popen(["explorer.exe", "ms-screenclip:"])
+        return "Zieh einfach einen Bereich auf."
+
+    # Workspaces & eigene Befehle
+    m = re.match(r"^(?:starte?|öffne|lade|mach)\s+(?:den |meinen |das )?workspace\s+(.+)$", core)
+    if m:
+        with DATA_LOCK:
+            ws = ai_find_named(m.group(1), USER_DATA["workspaces"])
+        if not ws:
+            return f"Einen Workspace {m.group(1)} kenne ich nicht."
+        started = len(launch_workspace(ws["id"])["started"])
+        return f"Workspace {ws['name']} gestartet, {started} {'Eintrag' if started == 1 else 'Einträge'} geöffnet."
+    m = re.match(r"^(?:führe|starte?)\s+(?:den |meinen )?(?:befehl\s+)?(.+?)(?:\s+aus)?$", core)
+    if m and ("befehl" in core or core.startswith("führe")):
+        with DATA_LOCK:
+            cmd = ai_find_named(m.group(1), USER_DATA["commands"])
+        if cmd:
+            run_custom_command(cmd["id"])
+            return f"Befehl {cmd['name']} läuft."
+        if "befehl" in core:
+            return f"Einen Befehl {m.group(1)} kenne ich nicht."
+
+    # Suchen (freier Text so, wie gesagt: ohne Zahlen-Umwandlung und mit Groß-/Kleinschreibung)
+    query = ai_plain(text, keep_case=True)
+    m = re.match(r"^(?:such\w*|zeig\w*|spiel\w*)\s+(?:mir\s+)?(?:auf|bei|in)\s+youtube\s+(?:nach\s+)?(.+)$", query, re.I) or \
+        re.match(r"^(?:spiel\w*|such\w*|zeig\w*)\s+(?:mir\s+)?(.+?)\s+(?:auf|bei)\s+youtube$", query, re.I)
+    if m:
+        open_url("https://www.youtube.com/results?search_query=" + urllib.parse.quote(m.group(1)))
+        return f"Hier ist YouTube zu {m.group(1)}."
+    m = re.match(r"^(?:bitte\s+)?(?:such\w*|google\w*|recherchier\w*)\s+(?:mir\s+)?(?:im internet\s+|online\s+|bei google\s+)?(?:nach\s+)?(.+)$", query, re.I)
+    if m:
+        open_url("https://www.google.com/search?q=" + urllib.parse.quote(m.group(1)))
+        return f"Ich suche nach {m.group(1)}."
+
+    # Öffnen: "öffne spotify", "starte bitte den explorer", "kannst du discord öffnen", "spotify"
+    m = AI_OPEN_RE.match(core) or AI_OPEN_RE2.match(core)
+    target = ai_find_target(m.group(1)) if m else ai_find_target(core, loose=False)
+    return ai_open(target) if target else None
+
+# ---------------- KI-Gehirn: lokales Sprachmodell über Ollama (optional) ----------------
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+AI_MODELS = ("qwen2.5:3b", "llama3.2:3b", "qwen2.5:7b")
+LLM_JOB = {"running": False, "phase": None, "progress": None, "message": "", "ok": None}
+LLM_LOCK = threading.Lock()
+LLM_CACHE = {"ts": 0.0, "status": None}
+AI_CHAT = deque(maxlen=8)  # kurzer Verlauf, damit Rückfragen funktionieren
+LLM_SYSTEM = """Du bist NEXUS, ein freundlicher Sprachassistent, der lokal auf einem Windows-PC läuft.
+Antworte immer auf Deutsch und kurz (höchstens zwei Sätze), weil deine Antwort vorgelesen wird.
+Antworte ausschließlich mit JSON in der Form {"command": "...", "reply": "..."}.
+"command" bleibt leer, wenn nur eine Antwort nötig ist. Soll am PC etwas passieren, schreib genau einen dieser Befehle:
+"öffne <app, ordner oder webseite>", "suche nach <begriff>", "suche auf youtube nach <begriff>",
+"erinnere mich in <zahl> minuten an <text>", "stell einen timer auf <zahl> minuten", "lauter", "leiser", "ton aus",
+"nächstes lied", "pause", "wie spät ist es", "systemstatus", "mach einen speedtest", "sortiere die downloads",
+"sperre den pc", "starte workspace <name>", "führe befehl <name> aus".
+"reply" ist deine gesprochene Antwort; bei einem Befehl reicht eine kurze Bestätigung.
+Erfinde nichts über den PC. Wenn du etwas nicht weißt, sag es ehrlich."""
+
+def find_ollama():
+    path = shutil.which("ollama")
+    if path:
+        return path
+    local = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe")
+    return local if os.path.exists(local) else None
+
+def ollama_call(path, body=None, timeout=5):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(OLLAMA_URL + path, data=data, headers={"Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+def llm_status(max_age=8):
+    if not LLM_CACHE["status"] or time.time() - LLM_CACHE["ts"] > max_age:
+        model = get_settings()["ai_model"]
+        st = {"installed": bool(find_ollama()), "running": False, "models": [], "model": model, "ready": False}
+        try:
+            with ollama_call("/api/tags", timeout=1.5) as resp:
+                st["models"] = [m["name"] for m in json.load(resp).get("models", [])]
+            st.update(running=True, installed=True)
+            st["ready"] = model in st["models"] or f"{model}:latest" in st["models"]
+        except Exception:
+            pass
+        LLM_CACHE.update(ts=time.time(), status=st)
+    return dict(LLM_CACHE["status"], job=dict(LLM_JOB))
+
+def ensure_ollama_running():
+    def alive():
+        try:
+            ollama_call("/api/tags", timeout=1.5).close()
+            return True
+        except Exception:
+            return False
+    if alive():
+        return True
+    exe = find_ollama()
+    if not exe:
+        return False
+    subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=subprocess.CREATE_NO_WINDOW)
+    for _ in range(40):
+        time.sleep(0.5)
+        if alive():
+            return True
+    return False
+
+def install_llm():
+    with LLM_LOCK:
+        if LLM_JOB["running"]:
+            raise ValueError("Die Installation läuft bereits")
+        LLM_JOB.update(running=True, phase="install", progress=None, message="Ollama wird installiert …", ok=None)
+    model = get_settings()["ai_model"]
+
+    def worker():
+        try:
+            if not find_ollama():
+                res = run_winget(["install", "--id", "Ollama.Ollama", "--exact", "--silent",
+                                  "--accept-package-agreements"], timeout=1800)
+                if not find_ollama():
+                    raise RuntimeError("Ollama-Installation fehlgeschlagen: " + " ".join(clean_winget_output(res.stdout)[-2:]))
+            LLM_JOB.update(phase="start", message="Ollama wird gestartet …")
+            if not ensure_ollama_running():
+                raise RuntimeError("Ollama startet nicht")
+            LLM_JOB.update(phase="pull", message=f"{model} wird geladen …", progress=0)
+            with ollama_call("/api/pull", {"model": model, "stream": True}, timeout=3600) as resp:
+                for line in resp:
+                    try:
+                        evt = json.loads(line)
+                    except ValueError:
+                        continue
+                    if evt.get("error"):
+                        raise RuntimeError(evt["error"])
+                    if evt.get("total") and evt.get("completed") is not None:
+                        LLM_JOB["progress"] = round(evt["completed"] * 100 / evt["total"], 1)
+                    LLM_JOB["message"] = f"{model}: {evt.get('status', '')}"
+            LLM_JOB.update(ok=True, progress=100, message=f"KI-Gehirn bereit: {model}")
+        except Exception as e:
+            LLM_JOB.update(ok=False, message=str(e))
+        LLM_JOB.update(running=False, phase=None)
+        LLM_CACHE["ts"] = 0
+
+    threading.Thread(target=worker, daemon=True).start()
+    return dict(LLM_JOB)
+
+def ai_llm(text):
+    st = llm_status()
+    if not st["ready"]:
+        # Installiert, aber nicht gestartet: höchstens alle 5 Minuten einen Startversuch, sonst wartet jede Frage
+        if not st["installed"] or st["running"] or time.time() - LLM_CACHE.get("start_tried", 0) < 300:
+            return None
+        LLM_CACHE["start_tried"] = time.time()
+        if not ensure_ollama_running() or not llm_status(max_age=0)["ready"]:
+            return None
+    now = datetime.now()
+    with AI_TARGET_LOCK:
+        apps = sorted({t["label"] for t in AI_TARGETS.values() if t["kind"] == "app"})[:80]
+    with DATA_LOCK:
+        workspaces = [w["name"] for w in USER_DATA["workspaces"]]
+        commands = [c["name"] for c in USER_DATA["commands"]]
+    context = (f"\n\nJetzt: {DAYS_DE[now.weekday()]}, {now:%d.%m.%Y %H:%M} Uhr\nInstallierte Apps: {', '.join(apps) or '—'}"
+               f"\nWorkspaces: {', '.join(workspaces) or '—'}\nEigene Befehle: {', '.join(commands) or '—'}")
+    body = {"model": get_settings()["ai_model"], "format": "json", "stream": False, "keep_alive": "15m",
+            "options": {"temperature": 0.3},
+            "messages": [{"role": "system", "content": LLM_SYSTEM + context}, *AI_CHAT, {"role": "user", "content": text}]}
+    with ollama_call("/api/chat", body, timeout=120) as resp:
+        content = json.load(resp)["message"]["content"]
+    try:
+        data = json.loads(content)
+    except ValueError:
+        data = {"command": "", "reply": content}
+    AI_CHAT.extend([{"role": "user", "content": text}, {"role": "assistant", "content": content}])
+    command = str(data.get("command") or "").strip()
+    # Das Modell darf nur die festen Befehle auslösen, nie selbst etwas ausführen
+    result = ai_rules(command) if command else None
+    return result or str(data.get("reply") or "").strip() or None
+
+# ---------------- Antworten ----------------
+
+def ai_speakable(text):
+    t = re.sub(r"[„“”\"«»]", "", text)
+    t = re.sub(r"(\d)\.(\d)", r"\1,\2", t)  # Dezimalkomma liest die deutsche Stimme richtig
+    for a, b in ((" %", " Prozent"), ("%", " Prozent"), (" GB", " Gigabyte"), (" MB", " Megabyte"),
+                 ("Mbit/s", "Megabit pro Sekunde"), (" ms", " Millisekunden"), (" °C", " Grad"), ("·", ",")):
+        t = t.replace(a, b)
+    return re.sub(r"\s+,", ",", t)
+
+def ai_reply(text):
+    ai_log("ai", text)
+    if get_settings()["ai_voice"]:
+        ai_speak(ai_speakable(text))
+
+def ai_execute(text):
+    reply = ai_rules(text)
+    if reply:
+        return reply
+    s = get_settings()
+    if s["ai_llm"]:
+        try:
+            reply = ai_llm(text)
+            if reply:
+                return reply
+        except Exception as e:
+            ai_log("system", f"KI-Gehirn nicht erreichbar: {e}")
+    plain = ai_plain(text)
+    m = AI_OPEN_RE.match(plain)
+    if m and re.match(r"(?:kannst du |könntest du )?(?:öffne|start)", plain):
+        return f"{m.group(1)[:1].upper() + m.group(1)[1:]} habe ich auf deinem PC nicht gefunden."
+    if s["ai_web_fallback"] and re.match(r"(wer|was|wie|wo|wann|warum|wieso|weshalb|welche\w*|wieviel|kann|ist|sind|gibt)\b", plain):
+        open_url("https://www.google.com/search?q=" + urllib.parse.quote(plain))
+        return "Das kann ich offline nicht beantworten, ich habe es für dich gegoogelt."
+    return "Das habe ich nicht verstanden. Sag zum Beispiel: Öffne Spotify, oder: Wie spät ist es?"
+
+def ai_handle(text, source="text"):
+    text = str(text or "").strip()[:500]
+    if not text:
+        return None
+    ai_log("user", text, source)
+    AI["thinking"] = True
+    try:
+        reply = ai_execute(text)
+    except Exception as e:
+        reply = f"Das hat nicht geklappt: {e}"
+    finally:
+        AI["thinking"] = False
+    ai_reply(reply)
+    return reply
+
+def ai_status(since):
+    since = int(since or 0)
+    st = {k: AI[k] for k in ("state", "ready", "level", "hypothesis", "error", "voice", "voices", "speaking",
+                             "thinking", "apps", "targets")}
+    st["browsers"] = installed_browsers()
+    st["piper"] = piper_status()
+    st["log"] = [e for e in list(AI_LOG) if e["id"] > since]
+    st["events"] = [e for e in list(AI_EVENTS) if e["id"] > since]
+    st["timers"] = [{"label": t["label"], "left": max(0, round(t["due"] - time.time()))} for t in list(AI_TIMERS)]
+    st["llm"] = llm_status()
+    return st
 
 
 # =====================================================================
@@ -3952,6 +5910,78 @@ HTML_UI = r"""<!DOCTYPE html>
   .settings-tabs button:hover { color: var(--text-primary); background: var(--tint-2); }
   .settings-tabs button.active { background: var(--accent-fill); color: var(--on-accent); font-weight: 600; }
   .preview-box { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 14px; border: 1px dashed var(--border-strong); border-radius: calc(8px * var(--rs)); }
+
+  /* ---------- NEXUS AI ---------- */
+  .ai-hero { display: flex; align-items: center; gap: 28px; padding: 24px 28px; }
+  .ai-hero-text { flex: 1; min-width: 0; }
+  .ai-hero-text h2 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.015em; margin-bottom: 6px; }
+  .ai-hero-text p { font-size: 0.8rem; color: var(--text-secondary); max-width: 540px; line-height: 1.5; }
+  .ai-live { margin-top: 12px; min-height: 1.4em; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; color: var(--text-primary); }
+  .ai-live:not(:empty)::before { content: '› '; color: var(--accent); }
+  .ai-hero-actions { display: flex; flex-direction: column; gap: 10px; min-width: 230px; }
+  .ai-orb { --lvl: 0; position: relative; width: 116px; height: 116px; flex-shrink: 0; display: grid; place-items: center; }
+  .ai-orb .core {
+    width: 72px; height: 72px; border-radius: 50%;
+    background: radial-gradient(circle at 34% 28%, #ffffff 0%, var(--accent) 36%, var(--accent-2) 100%);
+    box-shadow: 0 0 42px var(--accent-glow), inset 0 0 18px rgba(255, 255, 255, 0.35);
+    transform: scale(calc(1 + var(--lvl) * 0.32));
+    transition: transform 0.12s ease, filter 0.4s ease, opacity 0.4s ease;
+  }
+  .ai-orb .ring { position: absolute; inset: 16px; border-radius: 50%; border: 1px solid var(--accent); opacity: 0; pointer-events: none; }
+  .ai-orb[data-state="off"] .core, .ai-orb[data-state="starting"] .core { filter: grayscale(1) brightness(0.75); opacity: 0.5; }
+  .ai-orb[data-state="starting"] .core { animation: ai-breathe calc(1.2s * var(--speed)) ease-in-out infinite; }
+  .ai-orb[data-state="idle"] .core { animation: ai-breathe calc(3.4s * var(--speed)) ease-in-out infinite; }
+  .ai-orb[data-state="listening"] .ring { animation: ai-ring calc(1.6s * var(--speed)) ease-out infinite; }
+  .ai-orb[data-state="listening"] .ring + .ring { animation-delay: calc(0.8s * var(--speed)); }
+  .ai-orb[data-state="thinking"] .core { background: conic-gradient(from 0deg, var(--accent), var(--accent-2), var(--accent)); animation: ai-spin calc(1.1s * var(--speed)) linear infinite; }
+  .ai-orb[data-state="speaking"] .core { animation: ai-talk calc(0.45s * var(--speed)) ease-in-out infinite alternate; }
+  .ai-orb[data-state="error"] .core { background: radial-gradient(circle at 34% 28%, #fecaca, #ef4444 60%, #7f1d1d); box-shadow: 0 0 34px rgba(239, 68, 68, 0.35); }
+  @keyframes ai-breathe { 50% { transform: scale(1.06); } }
+  @keyframes ai-ring { from { opacity: 0.75; transform: scale(0.85); } to { opacity: 0; transform: scale(1.65); } }
+  @keyframes ai-spin { to { transform: rotate(360deg); } }
+  @keyframes ai-talk { from { transform: scale(0.95); } to { transform: scale(1.1); } }
+
+  .ai-chat { display: flex; flex-direction: column; gap: 8px; height: 330px; overflow-y: auto; padding: 2px 2px 8px; }
+  .ai-msg { max-width: 84%; padding: 9px 12px; border-radius: calc(13px * var(--rs)); font-size: 0.8rem; line-height: 1.45; user-select: text; animation: ai-msg-in calc(0.28s * var(--speed)) ease both; }
+  .ai-msg.user { align-self: flex-end; background: var(--accent-fill); color: var(--on-accent); border-bottom-right-radius: calc(4px * var(--rs)); }
+  .ai-msg.ai { align-self: flex-start; background: var(--tint-2); border: 1px solid var(--border); border-bottom-left-radius: calc(4px * var(--rs)); }
+  .ai-msg.system { align-self: center; max-width: 95%; padding: 2px 6px; color: var(--text-muted); font-size: 0.68rem; text-align: center; }
+  .ai-msg .meta { display: block; margin-top: 3px; font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; opacity: 0.6; }
+  .ai-empty { margin: auto; text-align: center; color: var(--text-muted); font-size: 0.76rem; line-height: 1.6; }
+  @keyframes ai-msg-in { from { opacity: 0; transform: translateY(6px); } }
+  .ai-input-row { display: flex; gap: 8px; margin-top: 10px; }
+  .ai-chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .ai-chip {
+    padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--tint-1);
+    font-family: var(--font-ui); font-size: 0.74rem; color: var(--text-secondary); cursor: pointer; transition: all 0.15s ease;
+  }
+  .ai-chip:hover { border-color: var(--border-strong); color: var(--text-primary); background: var(--tint-3); }
+  .ai-chip.static { cursor: default; }
+  .ai-chip b { color: var(--text-primary); font-family: 'JetBrains Mono', monospace; margin-left: 4px; }
+
+  .btn-primary kbd { color: inherit; border-color: currentColor; opacity: 0.55; }
+  .seg button:disabled { opacity: 0.35; cursor: not-allowed; }
+  .ai-mic { position: relative; }
+  .ai-mic:hover svg { transform: none; }
+  .ai-mic.on { color: var(--accent); border-color: var(--border-strong); }
+  .ai-mic-dot { position: absolute; top: 3px; right: 3px; width: 6px; height: 6px; border-radius: 50%; background: var(--status-ok); display: none; }
+  .ai-mic.on .ai-mic-dot { display: block; }
+  .ai-mic.listening .ai-mic-dot { display: block; background: var(--status-danger); animation: ai-dot 1s ease-out infinite; }
+  @keyframes ai-dot { from { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); } to { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); } }
+
+  .ai-pill {
+    position: fixed; top: 66px; left: 50%; z-index: 260;
+    display: flex; align-items: center; gap: 10px; max-width: min(560px, 90vw);
+    padding: 8px 16px 8px 9px; border-radius: 999px;
+    background: var(--surface-2); border: 1px solid var(--border-strong); box-shadow: var(--shadow);
+    font-size: 0.8rem; opacity: 0; pointer-events: none; transform: translate(-50%, -12px);
+    transition: opacity calc(0.2s * var(--speed)) ease, transform calc(0.2s * var(--speed)) ease;
+  }
+  .ai-pill.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; cursor: pointer; }
+  .ai-pill .ai-orb { width: 28px; height: 28px; }
+  .ai-pill .ai-orb .core { width: 18px; height: 18px; box-shadow: 0 0 14px var(--accent-glow); }
+  .ai-pill .ai-orb .ring { inset: 3px; }
+  #ai-pill-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 </style>
 </head>
 <body>
@@ -3993,6 +6023,11 @@ HTML_UI = r"""<!DOCTYPE html>
 
 <div class="toast-stack bottom-right" id="toast-stack"></div>
 
+<div class="ai-pill" id="ai-pill" onclick="goView('view-ai')">
+  <div class="ai-orb" id="ai-pill-orb" data-state="off"><div class="core"></div><span class="ring"></span><span class="ring"></span></div>
+  <span id="ai-pill-text">Ich höre …</span>
+</div>
+
 <header class="topbar">
   <div class="brand">
     <div class="brand-mark"></div>
@@ -4012,6 +6047,14 @@ HTML_UI = r"""<!DOCTYPE html>
       <div class="theme-dot" style="background:#f59e0b" onclick="setTheme('#f59e0b','rgba(245,158,11,0.22)')"></div>
       <div class="theme-dot" style="background:#ef4444" onclick="setTheme('#ef4444','rgba(239,68,68,0.22)')"></div>
     </div>
+    <button class="btn-secondary icon-btn ai-mic" id="ai-mic-btn" onclick="goView('view-ai')" title="NEXUS AI" aria-label="NEXUS AI">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="2" width="6" height="12" rx="3"></rect>
+        <path d="M5 10v1a7 7 0 0 0 14 0v-1"></path>
+        <line x1="12" y1="18" x2="12" y2="22"></line>
+      </svg>
+      <span class="ai-mic-dot"></span>
+    </button>
     <button class="btn-secondary" onclick="openPalette()" title="Alle Aktionen, Ansichten und Workspaces durchsuchen">Suche <kbd>Strg+K</kbd></button>
     <button class="btn-secondary" id="audio-toggle" onclick="toggleSound()">Sound: On</button>
     <button class="btn-secondary" onclick="refreshAll()">Refresh</button>
@@ -4076,6 +6119,10 @@ HTML_UI = r"""<!DOCTYPE html>
       <button class="nav-btn" onclick="switchView('view-convert', this)">
         <span>12 // File Converter</span>
         <span class="nav-badge">CONV</span>
+      </button>
+      <button class="nav-btn" onclick="switchView('view-ai', this)">
+        <span>13 // Nexus AI</span>
+        <span class="nav-badge" id="nav-ai-badge">VOICE</span>
       </button>
       <div class="nav-caption" style="margin-top:10px;">System</div>
       <button class="nav-btn" onclick="switchView('view-settings', this)">
@@ -4935,6 +6982,110 @@ HTML_UI = r"""<!DOCTYPE html>
       </div>
     </section>
 
+    <!-- VIEW 13: NEXUS AI -->
+    <section class="view-panel" id="view-ai">
+      <div class="card ai-hero">
+        <div class="ai-orb" id="ai-orb" data-state="off"><div class="core"></div><span class="ring"></span><span class="ring"></span></div>
+        <div class="ai-hero-text">
+          <h2 id="ai-headline">Sag „Hey Nexus“</h2>
+          <p id="ai-subline">Dein Sprachassistent läuft komplett offline auf diesem PC.</p>
+          <div class="ai-live" id="ai-live"></div>
+        </div>
+        <div class="ai-hero-actions">
+          <button class="btn-primary" id="ai-listen-btn" onclick="aiListenNow()">Jetzt zuhören <kbd>Strg+Leer</kbd></button>
+          <div class="tweak-row">
+            <div class="tweak-info"><h4>Auf „Hey Nexus“ hören</h4><p>Mikrofon bleibt an, solange NEXUS läuft</p></div>
+            <label class="switch"><input type="checkbox" data-toggle="ai_listen"><span class="slider"></span></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="section-label"><span>Unterhaltung</span><span id="ai-chat-state">BEREIT</span></div>
+          <div class="ai-chat" id="ai-chat">
+            <div class="ai-empty" id="ai-empty">Noch nichts gesagt.<br>Sprich mit „Hey Nexus …“ oder schreib unten etwas.</div>
+          </div>
+          <div class="ai-input-row">
+            <input type="text" id="ai-input" placeholder="z.B. öffne Spotify, erinnere mich in 10 Minuten an Pizza …" onkeydown="if (event.key === 'Enter') aiSend()">
+            <button class="btn-primary" onclick="aiSend()">Senden</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="section-label"><span>Stimme & Sound</span><span id="ai-engine-state">AUS</span></div>
+          <div class="stack" style="gap:10px;">
+            <div>
+              <label>Stimme</label>
+              <div style="display:flex; gap:6px;">
+                <select id="ai-voice-select" style="flex:1;" onchange="saveSetting({ ai_voice_name: this.value })"></select>
+                <button class="btn-secondary" onclick="aiPreview('voice')" title="Stimme probehören">▶ Anhören</button>
+              </div>
+              <div id="piper-row" style="display:none; margin-top:8px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <div class="list-sub" id="piper-info" style="white-space:normal; flex:1;"></div>
+                  <button class="btn-secondary btn-mini" id="piper-btn" onclick="installPiper()">Jetzt laden</button>
+                </div>
+                <div class="bar-track" id="piper-bar-track" style="margin:6px 0 0;"><div class="bar-fill" id="piper-bar"></div></div>
+              </div>
+            </div>
+            <div><label>Stimmlage</label><div class="seg" data-key="ai_voice_style"></div></div>
+            <div>
+              <label>Signalton beim Zuhören</label>
+              <div style="display:flex; gap:6px;">
+                <div class="seg" data-key="ai_sound" style="flex:1;"></div>
+                <button class="btn-secondary" onclick="aiPreview('sound')" title="Signalton probehören">▶</button>
+              </div>
+            </div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>Antworten vorlesen</h4><p id="ai-voice-info">Deutsche Windows-Stimme</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="ai_voice"><span class="slider"></span></label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="section-label"><span>Verhalten</span><span>WAKEWORD & WEB</span></div>
+          <div class="stack" style="gap:10px;">
+            <div><label>Empfindlichkeit für „Hey Nexus“</label><div class="seg" data-key="ai_sensitivity"></div></div>
+            <div><label>Browser für Links & Suchen</label><div class="seg" data-key="browser" id="ai-browser-seg"></div></div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>Unbekannte Fragen googeln</h4><p>Ohne KI-Gehirn: Fragen im Browser nachschlagen</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="ai_web_fallback"><span class="slider"></span></label>
+            </div>
+            <div class="list-row">
+              <div class="grow"><b id="ai-vocab-info">Wortschatz wird geladen …</b><div class="list-sub">Startmenü-Apps, Webseiten, Ordner, Workspaces & Befehle</div></div>
+              <button class="btn-secondary btn-mini" onclick="aiRescan()">Apps neu einlesen</button>
+              <button class="btn-secondary btn-mini" onclick="aiRestart()" title="Sprach-Engine neu starten">↻</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="section-label"><span>KI-Gehirn</span><span id="llm-state">OPTIONAL</span></div>
+          <p style="font-size:0.76rem; color:var(--text-secondary); line-height:1.5; margin-bottom:12px;">Ein lokales Sprachmodell (Ollama) beantwortet freie Fragen und versteht lockere Formulierungen – komplett offline, nichts verlässt deinen PC. Ohne es nutzt NEXUS nur die eingebauten Befehle.</p>
+          <div class="stack" style="gap:10px;">
+            <div><label>Modell</label><div class="seg" data-key="ai_model"></div></div>
+            <div class="tweak-row">
+              <div class="tweak-info"><h4>KI-Gehirn nutzen</h4><p id="llm-info">wird geprüft …</p></div>
+              <label class="switch"><input type="checkbox" data-toggle="ai_llm"><span class="slider"></span></label>
+            </div>
+            <div class="bar-track" id="llm-bar-track" style="margin:0; display:none;"><div class="bar-fill" id="llm-bar"></div></div>
+            <button class="btn-secondary" id="llm-btn" onclick="installLlm()">Installieren & Modell laden</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="section-label"><span>Probier mal</span><span>KLICK = AUSFÜHREN</span></div>
+        <div class="ai-chips" id="ai-examples"></div>
+        <div class="ai-chips" id="ai-timers" style="margin-top:12px;"></div>
+        <p class="list-sub" style="white-space:normal; margin-top:12px;">Tipp: „Hey Nexus“ kurz sagen, Signalton abwarten, dann den Befehl – oder alles in einem Satz. Hört NEXUS nichts, prüfe unter Windows-Einstellungen › Datenschutz › Mikrofon, ob Desktop-Apps zugreifen dürfen.</p>
+      </div>
+    </section>
+
     <!-- EINSTELLUNGEN -->
     <section class="view-panel" id="view-settings">
       <div class="settings-tabs" id="settings-tabs">
@@ -5271,6 +7422,9 @@ function switchView(viewId, btn) {
   } else if (viewId === 'view-convert') {
     loadConvertInfo();
     pollConvert();
+  } else if (viewId === 'view-ai') {
+    pollAi();
+    setTimeout(() => document.getElementById('ai-input').focus({ preventScroll: true }), 60);
   } else if (viewId === 'view-settings') {
     loadAutostart();
   } else if (viewId === 'view-tweaks') {
@@ -6498,6 +8652,8 @@ function paletteCommands() {
     { label: 'Fokus-Timer 25 min starten', hint: 'Alltag', run: () => startFocus(25, 'Fokus') },
     { label: 'Pause 5 min starten', hint: 'Alltag', run: () => startFocus(5, 'Pause') },
     { label: 'Einstellungen', hint: 'System', run: () => goView('view-settings') },
+    { label: 'NEXUS AI: Jetzt zuhören', hint: 'Sprache', run: aiListenNow },
+    { label: `NEXUS AI: „Hey Nexus“ ${settings.ai_listen ? 'ausschalten' : 'einschalten'}`, hint: 'Sprache', run: () => saveSetting({ ai_listen: !settings.ai_listen }) },
   ];
   return [...workspaces, ...commands, ...snippets, ...actions, ...focusCmds, ...places, ...views];
 }
@@ -6545,6 +8701,7 @@ function paletteSearch(query) {
   if (!q) return [];
   const open = (url) => api('/api/open_url', { url });
   return [
+    { label: `NEXUS fragen: ${q}`, hint: 'NEXUS AI', run: () => { goView('view-ai'); return aiSend(q); } },
     { label: `Google: ${q}`, hint: 'Websuche', run: () => open(`https://www.google.com/search?q=${encodeURIComponent(q)}`) },
     { label: `YouTube: ${q}`, hint: 'Websuche', run: () => open(`https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`) },
   ];
@@ -6588,6 +8745,10 @@ document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
     e.preventDefault();
     document.getElementById('palette').classList.contains('open') ? closePalette() : openPalette();
+  }
+  if (e.ctrlKey && e.code === 'Space') {
+    e.preventDefault();
+    aiListenNow();
   }
 });
 
@@ -6726,7 +8887,9 @@ let settings = {
   ...DEFAULT_DESIGN, sound: true, start_view: 'view-dash', monitor_interval: 1, refresh_interval: 5,
   brand_name: 'MONOLITH // NEXUS OS', brand_tag: 'v10.0 QUANTUM KERNEL', hidden_views: [], dash_hidden: [],
   welcome: true, welcome_style: 'stats', welcome_duration: 2500, welcome_name: '',
-  toasts: 'all', toast_pos: 'bottom-right', toast_duration: 5, clock_format: '24', clock_seconds: true
+  toasts: 'all', toast_pos: 'bottom-right', toast_duration: 5, clock_format: '24', clock_seconds: true,
+  browser: 'brave', ai_listen: false, ai_voice: true, ai_voice_name: '', ai_voice_style: 'cozy', ai_sound: 'soft',
+  ai_sensitivity: 'normal', ai_llm: true, ai_model: 'qwen2.5:3b', ai_web_fallback: true
 };
 const ACCENTS = ['#ffffff', '#3b82f6', '#a855f7', '#10b981', '#f59e0b', '#ef4444'];
 
@@ -6766,6 +8929,11 @@ const SEGMENTS = {
   toast_pos: [['top-right', 'Oben rechts'], ['bottom-right', 'Unten rechts'], ['bottom-center', 'Unten Mitte']],
   toast_duration: [[3, '3 s'], [5, '5 s'], [8, '8 s']],
   clock_format: [['24', '24 h'], ['12', '12 h']],
+  ai_sensitivity: [['low', 'Vorsichtig'], ['normal', 'Normal'], ['high', 'Empfindlich']],
+  ai_voice_style: [['cozy', 'Gemütlich'], ['normal', 'Normal'], ['lively', 'Lebhaft']],
+  ai_sound: [['soft', 'Sanft'], ['warm', 'Warm'], ['drop', 'Tropfen'], ['off', 'Aus']],
+  browser: [['brave', 'Brave'], ['chrome', 'Chrome'], ['edge', 'Edge'], ['firefox', 'Firefox'], ['default', 'Standard']],
+  ai_model: [['qwen2.5:3b', 'Qwen 2.5 · 3B'], ['llama3.2:3b', 'Llama 3.2 · 3B'], ['qwen2.5:7b', 'Qwen 2.5 · 7B']],
 };
 const DASH_SECTIONS = [['hero', 'Kopfbereich'], ['metrics', 'Kennzahlen'], ['monitor', 'Live-Monitor'], ['bottom', 'Signatur & Schnellaktionen']];
 
@@ -7984,6 +10152,288 @@ function renderConvertResults(job) {
   });
 }
 
+// ---------------- NEXUS AI ----------------
+const AI_EXAMPLES = ['Öffne Spotify', 'Wie spät ist es?', 'Erinnere mich in 10 Minuten an die Pizza', 'Stell einen Timer auf 5 Minuten',
+  'Suche auf YouTube nach Lofi Beats', 'Mach lauter', 'Nächstes Lied', 'Systemstatus', 'Mach einen Speedtest',
+  'Sortiere die Downloads', 'Zeig mir die Automationen', 'Was kannst du?'];
+const AI_HEADLINES = {
+  off: ['Sag „Hey Nexus“', 'Mikrofon ist aus. Schalte „Auf Hey Nexus hören“ ein, drück „Jetzt zuhören“ – oder schreib einfach unten.'],
+  starting: ['Sprach-Engine startet …', 'Beim ersten Start wird die Windows-Spracherkennung vorbereitet, das dauert ein paar Sekunden.'],
+  idle: ['Ich höre auf „Hey Nexus“', 'Sag „Hey Nexus“ und dann deinen Befehl – z.B. „öffne Discord“ oder „wie spät ist es?“'],
+  listening: ['Ich höre …', 'Sprich jetzt deinen Befehl.'],
+  thinking: ['Einen Moment …', 'Ich kümmere mich darum.'],
+  speaking: ['Ich antworte …', 'Mit „Hey Nexus, stopp“ unterbrichst du mich.'],
+  error: ['Die Sprach-Engine hat ein Problem', ''],
+};
+const AI_ENGINE_LABELS = { starting: 'STARTET', idle: 'HÖRT ZU', listening: 'AKTIV', thinking: 'DENKT', speaking: 'SPRICHT', error: 'FEHLER' };
+let aiSince = 0;
+let aiFirstPoll = true;
+let aiPollTimer = null;
+let aiPollGen = 0;
+let aiBusy = false;  // getippte Anfrage läuft noch
+let aiPillTimer = null;
+
+function aiOrbState(st) {
+  if (st.thinking || aiBusy) return 'thinking';
+  if (st.state === 'listening') return 'listening';
+  if (st.speaking) return 'speaking';
+  if (st.error && !st.ready) return 'error';
+  if (st.state === 'starting' || st.state === 'idle') return st.state;
+  return 'off';
+}
+
+function renderAiExamples() {
+  const examples = [...AI_EXAMPLES];
+  if (userData.workspaces && userData.workspaces[0]) examples.splice(4, 0, `Starte Workspace ${userData.workspaces[0].name}`);
+  const box = document.getElementById('ai-examples');
+  box.innerHTML = '';
+  examples.forEach(text => {
+    const chip = document.createElement('button');
+    chip.className = 'ai-chip';
+    chip.textContent = text;
+    chip.addEventListener('click', () => aiSend(text));
+    box.appendChild(chip);
+  });
+}
+
+const voiceLabel = name => name.replace(/^Microsoft /, '').replace(/ Desktop$/, ' (alt)');
+
+let voiceListKey = '';
+function renderVoiceSelect(voices, piper) {
+  const select = document.getElementById('ai-voice-select');
+  const natural = (piper && piper.voices) || [];
+  const key = JSON.stringify([voices.map(v => v.name), natural.map(v => v.key + v.installed)]);
+  if (key !== voiceListKey) {
+    voiceListKey = key;
+    select.innerHTML = '';
+    const group = (label, items) => {
+      const g = document.createElement('optgroup');
+      g.label = label;
+      items.forEach(([value, text]) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = text;
+        g.appendChild(opt);
+      });
+      select.appendChild(g);
+    };
+    group('Natürlich (neuronal, offline)', natural.map(v =>
+      [`piper:${v.key}`, `${v.name} · ${v.gender}${v.installed ? '' : ` · ${v.size} MB laden`}`]));
+    const gender = g => g === 'Female' ? 'weiblich' : g === 'Male' ? 'männlich' : 'Stimme';
+    group('Windows-Stimmen', [['', 'Automatisch (Katja)'], ...voices.map(v => [v.name, `${voiceLabel(v.name)} · ${gender(v.gender)}`])]);
+  }
+  if (document.activeElement !== select) select.value = settings.ai_voice_name || '';
+
+  // Download-Fortschritt bzw. Hinweis für eine gewählte, noch nicht geladene natürliche Stimme
+  const job = (piper && piper.job) || {};
+  const chosen = natural.find(v => `piper:${v.key}` === settings.ai_voice_name);
+  const row = document.getElementById('piper-row');
+  let info = '';
+  if (job.running) info = job.message;
+  else if (job.ok === false) info = job.message;
+  else if (chosen && !chosen.installed) info = `${chosen.name} ist noch nicht geladen (${chosen.size} MB) – bis dahin spricht die Windows-Stimme.`;
+  row.style.display = info ? '' : 'none';
+  document.getElementById('piper-btn').style.display = !job.running && chosen && !chosen.installed ? '' : 'none';
+  setText('piper-info', info);
+  document.getElementById('piper-bar-track').style.display = job.running ? '' : 'none';
+  document.getElementById('piper-bar').style.width = `${job.progress || 0}%`;
+}
+
+async function installPiper() {
+  await api('/api/piper_install', { voice: settings.ai_voice_name.replace(/^piper:/, '') });
+  pollAi();
+}
+
+async function aiPreview(kind) {
+  await api('/api/ai_preview', { kind });
+  pollAi();
+}
+
+function renderAiMessage(entry) {
+  const box = document.getElementById('ai-chat');
+  const empty = document.getElementById('ai-empty');
+  if (empty) empty.remove();
+  const el = document.createElement('div');
+  el.className = `ai-msg ${entry.role}`;
+  el.textContent = entry.text;
+  if (entry.role !== 'system') {
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = `${entry.time}${entry.source === 'voice' ? ' · gesprochen' : ''}`;
+    el.appendChild(meta);
+  }
+  box.appendChild(el);
+  while (box.children.length > 80) box.firstElementChild.remove();
+  box.scrollTop = box.scrollHeight;
+}
+
+function showAiPill(text, ms) {
+  setText('ai-pill-text', text);
+  document.getElementById('ai-pill').classList.add('show');
+  clearTimeout(aiPillTimer);
+  aiPillTimer = setTimeout(() => {
+    aiPillTimer = null;
+    document.getElementById('ai-pill').classList.remove('show');
+  }, ms);
+}
+
+function renderLlm(llm) {
+  const job = llm.job || {};
+  let info, state, btn = null;
+  if (job.running) {
+    info = job.message;
+    state = job.progress != null ? `${Math.round(job.progress)} %` : 'LÄUFT';
+  } else if (llm.ready) {
+    [info, state] = [`Bereit · ${llm.model} läuft lokal`, 'AKTIV'];
+  } else if (llm.running) {
+    [info, state, btn] = [`Ollama läuft, ${llm.model} fehlt noch`, 'MODELL FEHLT', 'Modell laden'];
+  } else if (llm.installed) {
+    [info, state, btn] = ['Ollama ist installiert, aber gestoppt', 'GESTOPPT', 'Starten & Modell laden'];
+  } else {
+    [info, state, btn] = ['Nicht installiert – NEXUS nutzt die eingebauten Befehle', 'OPTIONAL', 'Installieren & Modell laden'];
+  }
+  if (!job.running && job.ok === false) info = `Fehler: ${job.message}`;
+  setText('llm-info', info);
+  setText('llm-state', state);
+  const button = document.getElementById('llm-btn');
+  button.style.display = btn ? '' : 'none';
+  if (btn) button.textContent = btn;
+  document.getElementById('llm-bar-track').style.display = job.running ? '' : 'none';
+  document.getElementById('llm-bar').style.width = `${job.progress || 0}%`;
+}
+
+function renderAi(st) {
+  const viewActive = document.getElementById('view-ai').classList.contains('active');
+  const state = aiOrbState(st);
+  const lvl = state === 'listening' ? Math.min(1, (st.level || 0) / 60) : 0;
+  ['ai-orb', 'ai-pill-orb'].forEach(id => {
+    const orb = document.getElementById(id);
+    orb.dataset.state = state;
+    orb.style.setProperty('--lvl', lvl.toFixed(2));
+  });
+  const [head, sub] = AI_HEADLINES[state];
+  setText('ai-headline', head);
+  setText('ai-subline', state === 'error' ? st.error : sub);
+  setText('ai-live', state === 'listening' ? (st.hypothesis || '') : '');
+  setText('ai-engine-state', state === 'off' ? (st.ready ? 'BEREIT' : 'AUS') : AI_ENGINE_LABELS[state]);
+  setText('ai-chat-state', aiBusy || st.thinking ? 'DENKT …' : 'BEREIT');
+  setText('ai-vocab-info', `${st.apps} Apps erkannt · ${st.targets} Namen im Wortschatz`);
+  const piperVoice = ((st.piper && st.piper.voices) || []).find(v => `piper:${v.key}` === settings.ai_voice_name && v.installed);
+  setText('ai-voice-info', piperVoice ? `Spricht mit ${piperVoice.name} (natürliche Stimme)`
+    : st.voice ? `Spricht gerade mit ${voiceLabel(st.voice)}` : 'Deutsche Windows-Stimme');
+  renderVoiceSelect(st.voices || [], st.piper);
+  document.querySelectorAll('#ai-browser-seg button').forEach(b => {
+    const missing = b.dataset.value !== 'default' && !(st.browsers || []).includes(b.dataset.value);
+    b.disabled = missing;
+    b.title = missing ? 'Nicht installiert' : '';
+  });
+  setText('nav-ai-badge', settings.ai_listen ? 'LIVE' : 'VOICE');
+
+  const mic = document.getElementById('ai-mic-btn');
+  mic.classList.toggle('on', settings.ai_listen && st.ready);
+  mic.classList.toggle('listening', state === 'listening');
+  mic.title = settings.ai_listen ? (st.ready ? 'NEXUS AI hört auf „Hey Nexus“' : 'NEXUS AI startet …') : 'NEXUS AI (Mikrofon aus)';
+
+  // Nachrichten und UI-Aktionen teilen sich eine Nummernfolge. Zwei Abfragen können sich überschneiden
+  // und dieselben Einträge liefern, deshalb in Reihenfolge abarbeiten und nur Neues zeigen.
+  const items = [...(st.log || []), ...(st.events || [])].sort((a, b) => a.id - b.id);
+  items.forEach(item => {
+    if (item.id <= aiSince) return;
+    aiSince = item.id;
+    if (item.role) {
+      renderAiMessage(item);
+      if (!aiFirstPoll && item.role === 'ai') {
+        log(`NEXUS AI: ${item.text}`);
+        if (!viewActive) showAiPill(item.text, 4500);
+      }
+    } else if (!aiFirstPoll && item.type === 'view') {
+      goView(item.value);
+    }
+  });
+  aiFirstPoll = false;
+
+  const pill = document.getElementById('ai-pill');
+  if (viewActive) {
+    pill.classList.remove('show');
+  } else if (state === 'listening' || (state === 'thinking' && st.thinking)) {
+    clearTimeout(aiPillTimer);
+    aiPillTimer = null;
+    setText('ai-pill-text', state === 'listening' ? (st.hypothesis || 'Ich höre …') : 'Einen Moment …');
+    pill.classList.add('show');
+  } else if (!aiPillTimer) {
+    pill.classList.remove('show');
+  }
+
+  const timers = document.getElementById('ai-timers');
+  timers.innerHTML = '';
+  (st.timers || []).forEach(t => {
+    const chip = document.createElement('span');
+    chip.className = 'ai-chip static';
+    chip.innerHTML = `⏱ ${esc(t.label)}<b>${Math.floor(t.left / 60)}:${String(t.left % 60).padStart(2, '0')}</b>`;
+    timers.appendChild(chip);
+  });
+  renderLlm(st.llm || {});
+  return state;
+}
+
+async function pollAi() {
+  clearTimeout(aiPollTimer);
+  const gen = ++aiPollGen;
+  let state = 'off';
+  try {
+    state = renderAi(await api('/api/ai_status', { since: aiSince }));
+  } catch (e) {
+    // Server kurz nicht erreichbar: beim nächsten Durchlauf erneut versuchen
+  }
+  if (gen !== aiPollGen) return;  // ein neuerer Aufruf hat übernommen
+  const viewActive = document.getElementById('view-ai').classList.contains('active');
+  const busy = ['listening', 'thinking', 'speaking', 'starting'].includes(state);
+  aiPollTimer = setTimeout(pollAi, busy || viewActive ? 300 : (settings.ai_listen ? 700 : 2500));
+}
+
+async function aiSend(text) {
+  const input = document.getElementById('ai-input');
+  text = String(text ?? input.value).trim();
+  if (!text || aiBusy) return;
+  input.value = '';
+  aiBusy = true;
+  pollAi();
+  try {
+    await api('/api/ai_text', { text });
+  } finally {
+    aiBusy = false;
+    pollAi();
+  }
+}
+
+async function aiListenNow() {
+  TactileAudio.click(240);
+  await api('/api/ai_listen');
+  pollAi();
+}
+
+async function aiRescan() {
+  const res = await api('/api/ai_rescan');
+  log(`NEXUS AI kennt jetzt ${res.apps} Apps.`, true);
+  pollAi();
+}
+
+async function aiRestart() {
+  await api('/api/ai_restart');
+  log('Sprach-Engine wird neu gestartet …', true);
+  pollAi();
+}
+
+async function installLlm() {
+  const size = { 'qwen2.5:3b': '1,9 GB', 'llama3.2:3b': '2 GB', 'qwen2.5:7b': '4,7 GB' }[settings.ai_model];
+  const ok = await nexusConfirm(`NEXUS installiert Ollama über winget (falls noch nicht da) und lädt das Modell ${settings.ai_model} (${size}). Danach läuft alles offline auf deinem PC.`,
+    { title: 'KI-Gehirn installieren?', confirm: 'Installieren' });
+  if (!ok) return;
+  await api('/api/llm_install');
+  log('KI-Gehirn wird eingerichtet – das kann ein paar Minuten dauern.', true);
+  pollAi();
+}
+
 setInterval(() => {
   document.getElementById('sidebar-clock').innerText = fmtClock(new Date());
   pollPowerStatus().catch(() => {});
@@ -8017,6 +10467,8 @@ window.addEventListener('load', async () => {
   loadAutomations().catch(() => {});
   loadUserData(true)
     .then(() => {
+      renderAiExamples();
+      pollAi();
       if (settings.start_view !== 'view-dash') goView(settings.start_view);
       return settings.welcome ? showWelcome() : hideWelcomeNow();
     })
@@ -8389,7 +10841,52 @@ class NexusMonolithHandler(BaseHTTPRequestHandler):
             self._send_json(COMMAND_RUNS.get(payload.get("id"), {"running": False, "output": "", "code": None}))
 
         elif self.path == "/api/settings_save":
-            self._send_json(save_settings(payload))
+            res = save_settings(payload)
+            if "ai_model" in payload:
+                LLM_CACHE["ts"] = 0
+            ai_apply_settings()
+            # Neue Stimme oder neuen Ton gleich vorführen; eine neue Piper-Stimme erst laden (spricht danach selbst)
+            if payload.get("ai_sound", "off") != "off":
+                ai_preview("sound")
+            voice = res["ai_voice_name"]
+            if "ai_voice_name" in payload and voice.startswith("piper:") and not piper_installed(voice[6:]):
+                if not PIPER_JOB["running"]:
+                    install_piper_voice(voice[6:])
+            elif "ai_voice_name" in payload or "ai_voice_style" in payload:
+                ai_preview("voice")
+            self._send_json(res)
+
+        elif self.path == "/api/ai_preview":
+            self._send_json(ai_preview(payload.get("kind")))
+
+        elif self.path == "/api/ai_status":
+            self._send_json(ai_status(payload.get("since", 0)))
+
+        elif self.path == "/api/ai_text":
+            self._send_json({"reply": ai_handle(payload.get("text"), "text")})
+
+        elif self.path == "/api/ai_listen":
+            self._send_json(ai_listen_now())
+
+        elif self.path == "/api/ai_stop_speaking":
+            ai_stop_speaking()
+            self._send_json({"ok": True})
+
+        elif self.path == "/api/piper_install":
+            self._send_json(install_piper_voice(payload.get("voice")))
+
+        elif self.path == "/api/ai_rescan":
+            scan_start_apps()
+            self._send_json({"apps": AI["apps"], "targets": AI["targets"]})
+
+        elif self.path == "/api/ai_restart":
+            SPEECH.stop()
+            AI["error"] = None
+            SPEECH.start()
+            self._send_json({"ok": True})
+
+        elif self.path == "/api/llm_install":
+            self._send_json(install_llm())
 
         elif self.path == "/api/autostart_get":
             self._send_json({"enabled": is_autostart_enabled(), "command": autostart_command()})
@@ -8490,6 +10987,7 @@ def main():
     load_user_data()
     # Erst nach load_user_data starten, sonst laufen "Beim NEXUS-Start"-Automationen gegen leere Daten ins Leere
     threading.Thread(target=automation_loop, daemon=True).start()
+    threading.Thread(target=ai_loop, daemon=True).start()
     server =ThreadingHTTPServer(("127.0.0.1", 0), NexusMonolithHandler)
     url = f"http://127.0.0.1:{server.server_port}"
     threading.Thread(target=launch_window, args=(url,), daemon=True).start()
