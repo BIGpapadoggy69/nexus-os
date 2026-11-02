@@ -290,6 +290,7 @@ Jedes große Update erscheint als eigene Version unter [**Releases**](https://gi
 
 | Version | Highlights |
 |---|---|
+| [**v3.1.0**](https://github.com/BIGpapadoggy69/nexus-os/releases/tag/v3.1.0) | Bessere Spracherkennung: Whisper schreibt nach „Hey Nexus“ mit, offline |
 | [**v3.0.0**](https://github.com/BIGpapadoggy69/nexus-os/releases/tag/v3.0.0) | Big UI-Update: Video-Hintergründe, Live-Hintergründe, Glas & Effekte, Looks |
 | [**v2.0.0**](https://github.com/BIGpapadoggy69/nexus-os/releases/tag/v2.0.0) | NEXUS AI: Sprachassistent „Hey Nexus“, natürliche Stimmen, lokales KI-Gehirn |
 | [**v1.0.0**](https://github.com/BIGpapadoggy69/nexus-os/releases/tag/v1.0.0) | Erste Version: Dashboard, Automationen, File Converter, Netz-Diagnose, Alltag |
