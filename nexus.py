@@ -1721,6 +1721,8 @@ DEFAULT_SETTINGS = {
     "ai_llm": True,
     "ai_model": "qwen2.5:3b",
     "ai_web_fallback": True,
+    "ai_whisper": True,  # greift erst, wenn Whisper geladen ist
+    "ai_whisper_model": "small",
 }
 
 SETTING_CHOICES = {
@@ -1753,10 +1755,11 @@ SETTING_CHOICES = {
     "ai_voice_style": ("cozy", "normal", "lively"),
     "ai_sound": ("soft", "warm", "drop", "off"),
     "ai_model": ("qwen2.5:3b", "llama3.2:3b", "qwen2.5:7b"),
+    "ai_whisper_model": ("base", "small", "medium"),
 }
 SETTING_BOOLS = ("sound", "glow", "animations", "show_console", "nav_numbers", "accent_gradient",
                  "mono_values", "hover_lift", "welcome", "clock_seconds",
-                 "ai_listen", "ai_voice", "ai_llm", "ai_web_fallback",
+                 "ai_listen", "ai_voice", "ai_llm", "ai_web_fallback", "ai_whisper",
                  "bg_vignette", "bg_kenburns", "bg_pause_hidden", "border_glow", "text_shadow", "btn_shine")
 SETTING_RANGES = {  # Schieberegler: (min, max)
     "bg_opacity": (0, 100), "bg_blur": (0, 40), "bg_dim": (0, 95), "bg_brightness": (40, 160),
@@ -3154,6 +3157,14 @@ public static class NexusSpeech
     static double commandThreshold = 0.2;
     const int WakeWords = 2;  // alle Wake-Phrasen bestehen aus zwei Wörtern ("hey nexus")
     const string Dictation = "\u0001DICTATION";
+    // Whisper-Modus: Befehle nicht selbst erkennen, sondern die Aufnahme als WAV melden (Python schreibt mit)
+    static volatile bool externalStt;
+    static string audioDir;
+    static int audioCount;
+    // Ausnahme: feste Befehle ohne Diktat-Teil, bei denen SAPI sehr sicher ist. Whisper bräuchte dafür ein paar
+    // Sekunden ("lauter", "wie spät ist es"). Beim Diktat ist SAPIs Konfidenz wertlos (oft 1.0 für Unsinn).
+    static readonly HashSet<string> GrammarOnly = new HashSet<string> { "open", "workspace", "command", "timer", "fixed" };
+    const double TrustSapi = 0.6;
 
     static string Esc(string s)
     {
@@ -3579,6 +3590,57 @@ public static class NexusSpeech
              + ",\"kind\":\"" + Esc(kind) + "\",\"wake\":" + (wake ? "true" : "false") + "}");
     }
 
+    // Ende von "Hey Nexus" in der Aufnahme, mit etwas Vorlauf, falls die Wortgrenze zu spät sitzt.
+    // Mehr als ~60 ms lässt "-xus" drin, daraus macht Whisper dann "Los" oder "Plus".
+    static TimeSpan WakeEnd(RecognitionResult r)
+    {
+        try
+        {
+            var wake = r.GetAudioForWordRange(r.Words[0], r.Words[WakeWords - 1]);
+            var end = wake.AudioPosition + wake.Duration - TimeSpan.FromMilliseconds(60);
+            return end > TimeSpan.Zero ? end : TimeSpan.Zero;
+        }
+        catch
+        {
+            return TimeSpan.Zero;  // ganze Aufnahme; das Wakeword entfernt Python aus dem Text
+        }
+    }
+
+    // Aufnahme ab "skip" als WAV ablegen und melden. Selbst geschnitten statt GetRange,
+    // das an ungeraden Bytes schneiden und so 16-Bit-Samples verschieben kann.
+    static bool EmitAudio(RecognitionResult r, TimeSpan skip, string text, double conf, string kind, bool wake)
+    {
+        try
+        {
+            var fmt = r.Audio.Format;
+            if (fmt.EncodingFormat != EncodingFormat.Pcm) return false;
+            var raw = new MemoryStream();
+            r.Audio.WriteToAudioStream(raw);
+            byte[] pcm = raw.ToArray();
+            int align = Math.Max(1, fmt.BlockAlign);
+            int from = Math.Min(pcm.Length, (int)(skip.TotalSeconds * fmt.AverageBytesPerSecond) / align * align);
+            int bytes = pcm.Length - from;
+            string path = Path.Combine(audioDir, "utterance_" + (Interlocked.Increment(ref audioCount) % 4) + ".wav");
+            using (var w = new BinaryWriter(File.Create(path)))
+            {
+                w.Write(Encoding.ASCII.GetBytes("RIFF")); w.Write(36 + bytes); w.Write(Encoding.ASCII.GetBytes("WAVE"));
+                w.Write(Encoding.ASCII.GetBytes("fmt ")); w.Write(16); w.Write((short)1); w.Write((short)fmt.ChannelCount);
+                w.Write(fmt.SamplesPerSecond); w.Write(fmt.AverageBytesPerSecond); w.Write((short)fmt.BlockAlign); w.Write((short)fmt.BitsPerSample);
+                w.Write(Encoding.ASCII.GetBytes("data")); w.Write(bytes);
+                w.Write(pcm, from, bytes);
+            }
+            Emit("{\"type\":\"audio\",\"path\":\"" + Esc(path) + "\",\"seconds\":" + Num(bytes / (double)fmt.AverageBytesPerSecond)
+                 + ",\"text\":\"" + Esc(text) + "\",\"conf\":" + Num(conf)
+                 + ",\"kind\":\"" + Esc(kind) + "\",\"wake\":" + (wake ? "true" : "false") + "}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (debug) Emit("{\"type\":\"debug\",\"kind\":\"audio\",\"error\":\"" + Esc(ex.Message) + "\"}");
+            return false;  // dann wie bisher mit dem SAPI-Text weiter
+        }
+    }
+
     static void OnRecognized(object sender, SpeechRecognizedEventArgs e)
     {
         var r = e.Result;
@@ -3596,17 +3658,34 @@ public static class NexusSpeech
             }
             var restWords = r.Words.Skip(WakeWords).ToList();
             double restConf = restWords.Count > 0 ? restWords.Average(w => (double)w.Confidence) : 0;
+            string restText = string.Join(" ", restWords.Select(w => w.Text));
+            // Whisper-Modus: egal wie sicher SAPI den Rest geraten hat, zählt nur, ob genug Ton dahinter ist.
+            // Kurzes ("Hey Nexus, stopp") bleibt bei SAPI, das ist dafür schneller und sicher genug.
+            if (externalStt && name != "wake" && !(GrammarOnly.Contains(name.Substring(5)) && restConf >= TrustSapi))
+            {
+                TimeSpan cut = WakeEnd(r);
+                if (r.Audio != null && r.Audio.Duration - cut > TimeSpan.FromMilliseconds(500) && EmitAudio(r, cut, restText, restConf, name.Substring(5), true))
+                {
+                    SetListening(false);
+                    return;
+                }
+            }
             // Wakeword sicher, Befehl dahinter nur geraten: wie ein reines "Hey Nexus" behandeln und zuhören
             if (name == "wake" || restConf < commandThreshold)
             {
                 Wake(wakeConf);
                 return;
             }
-            EmitHeard(string.Join(" ", restWords.Select(w => w.Text)), restConf, name.Substring(5), true);
+            EmitHeard(restText, restConf, name.Substring(5), true);
             SetListening(false);
             return;
         }
         if (!listening || IsChimeEcho(r)) return;
+        if (externalStt && !(GrammarOnly.Contains(name) && r.Confidence >= TrustSapi) && EmitAudio(r, TimeSpan.Zero, r.Text, r.Confidence, name, false))
+        {
+            SetListening(false);
+            return;
+        }
         if (r.Confidence < commandThreshold)
         {
             Emit("{\"type\":\"rejected\",\"text\":\"" + Esc(r.Text) + "\"}");
@@ -3630,6 +3709,12 @@ public static class NexusSpeech
             return;  // im Ruhezustand sind Ablehnungen normales Hintergrundrauschen
         }
         if (IsChimeEcho(r)) return;
+        // Gerade hier ist Whisper am wertvollsten: SAPI hat den Satz nicht verstanden, Whisper oft schon
+        if (externalStt && r != null && EmitAudio(r, TimeSpan.Zero, "", 0, "", false))
+        {
+            SetListening(false);
+            return;
+        }
         Emit("{\"type\":\"rejected\",\"text\":\"\"}");
         SetListening(false);
     }
@@ -3711,6 +3796,7 @@ public static class NexusSpeech
         culture = new CultureInfo("de-DE");
         Thread.CurrentThread.CurrentCulture = culture;
         Thread.CurrentThread.CurrentUICulture = culture;
+        audioDir = Path.GetDirectoryName(Path.GetFullPath(configPath));
 
         try
         {
@@ -3782,6 +3868,7 @@ public static class NexusSpeech
                     SpeechDone(gen);
                 }
                 else if (cmd == "threshold") wakeThreshold = double.Parse(arg, CultureInfo.InvariantCulture);
+                else if (cmd == "stt") externalStt = arg == "on";
                 else if (cmd == "chime") chimeStyle = arg;
                 else if (cmd == "chimetest") PlayChime(arg);
                 else if (cmd == "voice")
@@ -3879,7 +3966,7 @@ try {
 """
 
 AI = {"state": "off", "ready": False, "level": 0, "hypothesis": "", "error": None, "voice": None, "voices": [],
-      "speaking": False, "thinking": False, "apps": 0, "targets": 0, "vocab_hash": None}
+      "speaking": False, "thinking": False, "apps": 0, "targets": 0, "vocab_hash": None, "whisper": False}
 AI_PREVIEW_TEXT = "Hi, ich bin NEXUS. So klinge ich jetzt. Gefällt dir das?"
 AI_LOG = deque(maxlen=80)     # Unterhaltung für die UI (nur im Speicher, wird nicht gespeichert)
 AI_EVENTS = deque(maxlen=30)  # UI-Aktionen, z.B. "Ansicht wechseln"
@@ -4008,9 +4095,13 @@ def on_speech_event(evt):
     elif kind == "level":
         AI["level"] = evt.get("value", 0)
     elif kind == "hypothesis":
-        AI["hypothesis"] = evt.get("text", "")
+        # Mit Whisper wäre das nur SAPIs (meist falsches) Zwischenergebnis
+        AI["hypothesis"] = "" if AI["whisper"] else evt.get("text", "")
     elif kind == "heard":
         threading.Thread(target=ai_handle, args=(evt.get("text", ""), "voice"), daemon=True).start()
+        ai_after_listen()
+    elif kind == "audio":
+        threading.Thread(target=ai_hear_audio, args=(evt,), daemon=True).start()
         ai_after_listen()
     elif kind == "rejected":
         if evt.get("text"):
@@ -4038,6 +4129,8 @@ def ai_apply_settings():
     if not AI["ready"]:
         return
     SPEECH.send("threshold", AI_THRESHOLDS.get(s["ai_sensitivity"], 0.35))
+    AI["whisper"] = whisper_active()
+    SPEECH.send("stt", "on" if AI["whisper"] else "off")
     SPEECH.send("chime", s["ai_sound"])
     # Bei einer Piper-Stimme bleibt im Host die beste Windows-Stimme als Ersatz eingestellt
     host_voice = "" if s["ai_voice_name"].startswith("piper:") else s["ai_voice_name"].replace("|", "")
@@ -4063,6 +4156,46 @@ def ai_stop_speaking():
     PIPER.gen += 1  # noch laufende Piper-Synthese verwerfen
     SPEECH.send("stopsay")
     AI["speaking"] = False
+
+# ---------------- Optionale Engines: eigenes venv und Downloads (Piper, Whisper) ----------------
+
+def pip_error(output):
+    """Die Zeile einer pip-Fehlerausgabe, die die Ursache nennt; die letzte ist oft nur ein Link zur Doku."""
+    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    for i, line in enumerate(lines[:-1]):
+        if line.startswith("The conflict is caused by"):
+            return lines[i + 1]  # z.B. "piper-tts 1.2.0 depends on piper-phonemize~=1.1.0"
+    errors = [l for l in lines if l.startswith("ERROR:") and "ResolutionImpossible" not in l]
+    return re.sub(r"^ERROR:\s*", "", (errors or lines or ["Installation fehlgeschlagen"])[0])
+
+def ai_venv(env_dir, package):
+    """Eigenes venv mit dem Python von NEXUS anlegen und ein Paket hineininstallieren."""
+    base = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    base = base if os.path.exists(base) else sys.executable  # pythonw.exe -> python.exe
+    for args in ([base, "-m", "venv", env_dir],
+                 [os.path.join(env_dir, "Scripts", "python.exe"), "-m", "pip", "install",
+                  "--disable-pip-version-check", "-q", package]):
+        res = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             creationflags=subprocess.CREATE_NO_WINDOW, timeout=900)
+        if res.returncode != 0:
+            # Fehlende Pakete liegen fast immer an Python-Version oder 32 Bit, deshalb gleich mitnennen
+            raise RuntimeError(f"{pip_error(res.stderr + res.stdout)} (Python {sys.version_info.major}."
+                               f"{sys.version_info.minor}, {struct.calcsize('P') * 8} Bit)")
+
+def ai_download(url, target, job):
+    """Datei laden, Fortschritt in job["progress"]; erst fertig umbenannt, damit Abbrüche nicht als geladen gelten."""
+    req = urllib.request.Request(url, headers={"User-Agent": "NexusOS"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(target + ".part", "wb") as f:
+        total, done = int(resp.headers.get("Content-Length") or 0), 0
+        while True:
+            chunk = resp.read(262144)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total:
+                job["progress"] = round(done * 100 / total, 1)
+    os.replace(target + ".part", target)
 
 # ---------------- Natürliche Stimmen: Piper (neuronal, offline, optional) ----------------
 # Wird erst bei Auswahl einer Piper-Stimme installiert: eigenes venv mit "piper-tts" + Stimmmodell von Hugging Face.
@@ -4162,33 +4295,15 @@ def install_piper_voice(key):
             if not piper_installed():
                 if getattr(sys, "frozen", False):
                     raise RuntimeError("Natürliche Stimmen brauchen die Python-Version von NEXUS")
-                base = os.path.join(os.path.dirname(sys.executable), "python.exe")
-                base = base if os.path.exists(base) else sys.executable  # pythonw.exe -> python.exe
                 PIPER_JOB["message"] = "Sprach-Engine wird eingerichtet (einmalig, ca. 30 MB) …"
-                for args in ([base, "-m", "venv", os.path.join(PIPER_DIR, "env")],
-                             [piper_python(), "-m", "pip", "install", "--disable-pip-version-check", "-q", "piper-tts"]):
-                    res = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                         creationflags=subprocess.CREATE_NO_WINDOW, timeout=900)
-                    if res.returncode != 0:
-                        raise RuntimeError((res.stderr or res.stdout).strip().splitlines()[-1] if (res.stderr or res.stdout).strip() else "Installation fehlgeschlagen")
+                ai_venv(os.path.join(PIPER_DIR, "env"), "piper-tts")
             path = PIPER_VOICES[key][2]
             for ext in (".onnx.json", ".onnx"):
                 target = piper_model(key) + ext[5:]
                 if os.path.exists(target):
                     continue
                 PIPER_JOB["message"] = f"{name} wird geladen …"
-                req = urllib.request.Request(f"{PIPER_BASE_URL}/{path}/{key}{ext}", headers={"User-Agent": "NexusOS"})
-                with urllib.request.urlopen(req, timeout=60) as resp, open(target + ".part", "wb") as f:
-                    total, done = int(resp.headers.get("Content-Length") or 0), 0
-                    while True:
-                        chunk = resp.read(262144)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        done += len(chunk)
-                        if total:
-                            PIPER_JOB["progress"] = round(done * 100 / total, 1)
-                os.replace(target + ".part", target)
+                ai_download(f"{PIPER_BASE_URL}/{path}/{key}{ext}", target, PIPER_JOB)
             PIPER_JOB.update(ok=True, progress=100, message=f"{name} ist bereit")
             if get_settings()["ai_voice_name"] == "piper:" + key:
                 ai_speak(AI_PREVIEW_TEXT)
@@ -4225,6 +4340,168 @@ def ai_speak(text):
             SPEECH.say(text)
 
     threading.Thread(target=run, daemon=True).start()
+
+# ---------------- Genaue Spracherkennung: Whisper (neuronal, offline, optional) ----------------
+# Die Windows-Erkennung hört dann nur noch auf "Hey Nexus" und das Satzende; den Satz selbst schreibt Whisper mit.
+# Wird erst auf Wunsch installiert: eigenes venv mit "faster-whisper" + Modell von Hugging Face.
+
+WHISPER_DIR = os.path.join(AI_DIR, "whisper")
+WHISPER_MODELS = {  # Schlüssel -> (Name, Repo auf Hugging Face, Größe in MB)
+    "base": ("Schnell", "Systran/faster-whisper-base", 141),
+    "small": ("Genau", "Systran/faster-whisper-small", 464),
+    "medium": ("Sehr genau", "Systran/faster-whisper-medium", 1460),
+}
+WHISPER_FILES = ("config.json", "tokenizer.json", "vocabulary.txt", "model.bin")  # model.bin zuletzt: der Balken zeigt das Große
+WHISPER_JOB = {"running": False, "model": None, "message": "", "progress": None, "ok": None}
+WHISPER_JOB_LOCK = threading.Lock()
+# Whisper kennt Deutsch viel aus Untertiteln und "hört" in Rauschen gern deren Abspann
+WHISPER_JUNK = re.compile(r"untertitel|amara\.org|\bzdf\b|\bwdr\b|\bswr\b|fürs zuschauen|abonnier", re.I)
+WHISPER_WAKE = re.compile(r"^\W*(?:(?:hey|hallo|hi|okay|ok)\W+)?ne(?:x|ks|cks)(?:us|is|os|es)\b\W*", re.I)
+
+# Läuft im Whisper-venv: hält das Modell im Speicher und schreibt pro Zeile eine WAV-Datei mit
+WHISPER_WORKER = r'''
+import json, os, sys
+from faster_whisper import WhisperModel
+model, loaded = None, None
+for line in sys.stdin:
+    job = {}
+    try:
+        job = json.loads(line)
+        if job["model"] != loaded:
+            model, loaded = None, None  # altes Modell erst freigeben
+            model = WhisperModel(job["model"], device="cpu", compute_type="int8", cpu_threads=min(8, os.cpu_count() or 4))
+            loaded = job["model"]
+        text = ""
+        if job.get("wav"):  # ohne WAV nur vorladen
+            # Kurzer Kontext hilft bei Groß-/Kleinschreibung; eine Liste mit App-Namen hat in Tests eher geschadet
+            segments, _ = model.transcribe(job["wav"], language="de", beam_size=5, vad_filter=True,
+                                           condition_on_previous_text=False, without_timestamps=True,
+                                           initial_prompt="Hey Nexus.")
+            # Stille, die Whisper trotzdem "verstanden" hat, verwerfen
+            text = " ".join(s.text.strip() for s in segments if not (s.no_speech_prob > 0.6 and s.avg_logprob < -1))
+        print(json.dumps({"id": job["id"], "ok": True, "text": text.strip()}), flush=True)
+    except Exception as e:
+        print(json.dumps({"id": job.get("id"), "ok": False, "error": str(e)}), flush=True)
+'''
+
+def whisper_python():
+    return os.path.join(WHISPER_DIR, "env", "Scripts", "python.exe")
+
+def whisper_model_dir(key):
+    return os.path.join(WHISPER_DIR, "models", key)
+
+def whisper_installed(key=None):
+    ok = os.path.exists(whisper_python()) and os.path.exists(os.path.join(WHISPER_DIR, "env", "Lib", "site-packages", "faster_whisper"))
+    return ok and (key is None or all(os.path.exists(os.path.join(whisper_model_dir(key), f)) for f in WHISPER_FILES))
+
+def whisper_active():
+    s = get_settings()
+    return s["ai_whisper"] and whisper_installed(s["ai_whisper_model"])
+
+def whisper_status():
+    return {"engine": whisper_installed(), "active": whisper_active(), "job": dict(WHISPER_JOB),
+            "models": [{"key": k, "name": v[0], "size": v[2], "installed": whisper_installed(k)}
+                       for k, v in WHISPER_MODELS.items()]}
+
+class WhisperEngine:
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+        self.n = 0
+
+    def transcribe(self, wav=None):
+        """Text der WAV-Datei; ohne WAV wird nur das Modell geladen (dauert ein paar Sekunden)."""
+        with self.lock:
+            if self.proc is None or self.proc.poll() is not None:
+                worker = os.path.join(WHISPER_DIR, "worker.py")
+                with open(worker, "w", encoding="utf-8") as f:
+                    f.write(WHISPER_WORKER)
+                self.proc = subprocess.Popen([whisper_python(), "-u", worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                             errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
+            self.n += 1
+            self.proc.stdin.write(json.dumps({"id": self.n, "model": whisper_model_dir(get_settings()["ai_whisper_model"]),
+                                              "wav": wav}) + "\n")
+            self.proc.stdin.flush()
+            while True:
+                line = self.proc.stdout.readline()
+                if not line:
+                    self.proc = None
+                    raise RuntimeError("Whisper wurde beendet")
+                if line.startswith("{"):
+                    res = json.loads(line)
+                    if res.get("id") == self.n:
+                        if not res.get("ok"):
+                            raise RuntimeError(res.get("error") or "Whisper-Fehler")
+                        return res.get("text", "")
+
+WHISPER = WhisperEngine()
+
+def whisper_preload():
+    # Sonst wartet der erste Befehl darauf, dass das Modell in den Speicher kommt
+    try:
+        WHISPER.transcribe()
+    except Exception:
+        pass
+
+def install_whisper(key):
+    if key not in WHISPER_MODELS:
+        raise ValueError("Unbekanntes Modell")
+    with WHISPER_JOB_LOCK:
+        if WHISPER_JOB["running"]:
+            raise ValueError("Whisper wird schon geladen")
+        WHISPER_JOB.update(running=True, model=key, message="Vorbereitung …", progress=None, ok=None)
+
+    def worker():
+        name, repo = WHISPER_MODELS[key][:2]
+        try:
+            if not whisper_installed():
+                if getattr(sys, "frozen", False):
+                    raise RuntimeError("Whisper braucht die Python-Version von NEXUS")
+                WHISPER_JOB["message"] = "Whisper wird eingerichtet (einmalig, ca. 300 MB) …"
+                ai_venv(os.path.join(WHISPER_DIR, "env"), "faster-whisper")
+            folder = whisper_model_dir(key)
+            os.makedirs(folder, exist_ok=True)
+            for file in WHISPER_FILES:
+                target = os.path.join(folder, file)
+                if not os.path.exists(target):
+                    WHISPER_JOB.update(message=f"Modell „{name}“ wird geladen …", progress=None)
+                    ai_download(f"https://huggingface.co/{repo}/resolve/main/{file}", target, WHISPER_JOB)
+            if get_settings()["ai_whisper_model"] == key:
+                WHISPER_JOB.update(message=f"Modell „{name}“ wird gestartet …", progress=None)
+                WHISPER.transcribe()  # lädt das Modell einmal probehalber, Fehler landen unten
+            WHISPER_JOB.update(ok=True, progress=100, message=f"Whisper „{name}“ ist bereit")
+            ai_apply_settings()
+        except Exception as e:
+            WHISPER_JOB.update(ok=False, message=f"Whisper konnte nicht geladen werden: {e}")
+        WHISPER_JOB.update(running=False)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return dict(WHISPER_JOB)
+
+def ai_hear_audio(evt):
+    """Eine Äußerung aus dem Sprach-Host mit Whisper mitschreiben; SAPIs eigener Text ist nur der Notnagel."""
+    AI["thinking"] = True
+    try:
+        text = WHISPER.transcribe(evt.get("path"))
+    except Exception as e:
+        ai_log("system", f"Whisper fehlgeschlagen ({e}), ich nehme die Windows-Erkennung.")
+        text = evt.get("text", "") if evt.get("conf", 0) >= 0.2 else ""  # darunter ist SAPIs Text nur geraten
+    finally:
+        AI["thinking"] = False
+        try:
+            os.remove(evt.get("path"))  # Aufnahme nicht liegen lassen: Unterhaltungen werden nicht gespeichert
+        except (OSError, TypeError):
+            pass
+    text = WHISPER_WAKE.sub("", text).strip()
+    if WHISPER_JUNK.search(text) or not re.search(r"\w", text):
+        text = ""
+    if text:
+        ai_handle(text, "voice")
+    elif evt.get("wake"):
+        SPEECH.send_or_queue("listen")  # nur "Hey Nexus" und Rauschen dahinter: zuhören wie nach dem Wakeword
+    else:
+        ai_reply("Das habe ich nicht verstanden.")
 
 # ---------------- Wortschatz: Apps, Webseiten, Ordner, NEXUS-Ansichten ----------------
 
@@ -4442,6 +4719,8 @@ def ai_loop():
             PIPER.synth(voice[6:], "Hallo.", 1.0)
         except Exception:
             pass
+    if whisper_active():
+        whisper_preload()
     while True:
         time.sleep(15)
         try:
@@ -4953,6 +5232,7 @@ def ai_status(since):
                              "thinking", "apps", "targets")}
     st["browsers"] = installed_browsers()
     st["piper"] = piper_status()
+    st["whisper"] = whisper_status()
     st["log"] = [e for e in list(AI_LOG) if e["id"] > since]
     st["events"] = [e for e in list(AI_EVENTS) if e["id"] > since]
     st["timers"] = [{"label": t["label"], "left": max(0, round(t["due"] - time.time()))} for t in list(AI_TIMERS)]
@@ -7439,6 +7719,20 @@ HTML_UI = r"""<!DOCTYPE html>
       </div>
 
       <div class="card">
+        <div class="section-label"><span>Spracherkennung</span><span id="whisper-state">WINDOWS</span></div>
+        <p style="font-size:0.76rem; color:var(--text-secondary); line-height:1.5; margin-bottom:12px;">Whisper schreibt alles nach „Hey Nexus“ viel genauer mit als die Windows-Spracherkennung – auch freie Fragen, Suchbegriffe und Erinnerungstexte. Läuft offline. „Schnell“ antwortet in etwa einer Sekunde, „Genau“ versteht deutlich mehr und braucht ein paar Sekunden, „Sehr genau“ lohnt sich nur auf starken PCs. Kurze, eindeutige Befehle wie „lauter“ gehen ohne Whisper sofort durch.</p>
+        <div class="stack" style="gap:10px;">
+          <div><label>Modell</label><div class="seg" data-key="ai_whisper_model"></div></div>
+          <div class="tweak-row">
+            <div class="tweak-info"><h4>Whisper nutzen</h4><p id="whisper-info">wird geprüft …</p></div>
+            <label class="switch"><input type="checkbox" data-toggle="ai_whisper"><span class="slider"></span></label>
+          </div>
+          <div class="bar-track" id="whisper-bar-track" style="margin:0; display:none;"><div class="bar-fill" id="whisper-bar"></div></div>
+          <button class="btn-secondary" id="whisper-btn" onclick="installWhisper()" style="display:none;">Laden</button>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="section-label"><span>Probier mal</span><span>KLICK = AUSFÜHREN</span></div>
         <div class="ai-chips" id="ai-examples"></div>
         <div class="ai-chips" id="ai-timers" style="margin-top:12px;"></div>
@@ -9352,6 +9646,7 @@ let settings = {
   toasts: 'all', toast_pos: 'bottom-right', toast_duration: 5, clock_format: '24', clock_seconds: true,
   browser: 'brave', ai_listen: false, ai_voice: true, ai_voice_name: '', ai_voice_style: 'cozy', ai_sound: 'soft',
   ai_sensitivity: 'normal', ai_llm: true, ai_model: 'qwen2.5:3b', ai_web_fallback: true,
+  ai_whisper: true, ai_whisper_model: 'small',
   bg_media: '', bg_pause_hidden: true
 };
 const ACCENTS = ['#ffffff', '#3b82f6', '#a855f7', '#10b981', '#f59e0b', '#ef4444'];
@@ -9399,6 +9694,7 @@ const SEGMENTS = {
   ai_sound: [['soft', 'Sanft'], ['warm', 'Warm'], ['drop', 'Tropfen'], ['off', 'Aus']],
   browser: [['brave', 'Brave'], ['chrome', 'Chrome'], ['edge', 'Edge'], ['firefox', 'Firefox'], ['default', 'Standard']],
   ai_model: [['qwen2.5:3b', 'Qwen 2.5 · 3B'], ['llama3.2:3b', 'Llama 3.2 · 3B'], ['qwen2.5:7b', 'Qwen 2.5 · 7B']],
+  ai_whisper_model: [['base', 'Schnell'], ['small', 'Genau'], ['medium', 'Sehr genau']],
 };
 const DASH_SECTIONS = [['hero', 'Kopfbereich'], ['metrics', 'Kennzahlen'], ['monitor', 'Live-Monitor'], ['bottom', 'Signatur & Schnellaktionen']];
 
@@ -11273,6 +11569,40 @@ function renderLlm(llm) {
   document.getElementById('llm-bar').style.width = `${job.progress || 0}%`;
 }
 
+const mbLabel = mb => mb >= 1000 ? `${(mb / 1000).toFixed(1).replace('.', ',')} GB` : `${mb} MB`;
+
+function renderWhisper(w) {
+  const job = w.job || {};
+  const chosen = (w.models || []).find(m => m.key === settings.ai_whisper_model) || {};
+  let info, state, btn = null;
+  if (job.running) {
+    info = job.message;
+    state = job.progress != null ? `${Math.round(job.progress)} %` : 'LÄDT';
+  } else if (!settings.ai_whisper) {
+    [info, state] = ['Aus – die Windows-Spracherkennung schreibt mit', 'WINDOWS'];
+  } else if (w.active) {
+    [info, state] = [`„${chosen.name}“ schreibt mit, Windows hört nur noch auf „Hey Nexus“`, 'WHISPER'];
+  } else {
+    // Die Engine selbst kommt beim ersten Mal dazu
+    [info, state, btn] = [`„${chosen.name}“ ist noch nicht geladen – bis dahin erkennt Windows`, 'NICHT GELADEN',
+      `Laden (${mbLabel((chosen.size || 0) + (w.engine ? 0 : 300))})`];
+  }
+  if (!job.running && job.ok === false) info = `Fehler: ${job.message}`;
+  setText('whisper-info', info);
+  setText('whisper-state', state);
+  const button = document.getElementById('whisper-btn');
+  button.style.display = btn ? '' : 'none';
+  if (btn) button.textContent = btn;
+  document.getElementById('whisper-bar-track').style.display = job.running ? '' : 'none';
+  document.getElementById('whisper-bar').style.width = `${job.progress || 0}%`;
+}
+
+async function installWhisper() {
+  await api('/api/whisper_install', { model: settings.ai_whisper_model });
+  log('Whisper wird eingerichtet – das kann ein paar Minuten dauern.', true);
+  pollAi();
+}
+
 function renderAi(st) {
   const viewActive = document.getElementById('view-ai').classList.contains('active');
   const state = aiOrbState(st);
@@ -11344,6 +11674,7 @@ function renderAi(st) {
     timers.appendChild(chip);
   });
   renderLlm(st.llm || {});
+  renderWhisper(st.whisper || {});
   return state;
 }
 
@@ -11882,6 +12213,8 @@ class NexusHandler(BaseHTTPRequestHandler):
                     install_piper_voice(voice[6:])
             elif "ai_voice_name" in payload or "ai_voice_style" in payload:
                 ai_preview("voice")
+            if "ai_whisper_model" in payload and whisper_active():
+                threading.Thread(target=whisper_preload, daemon=True).start()
             self._send_json(res)
 
         elif self.path == "/api/ai_preview":
@@ -11902,6 +12235,9 @@ class NexusHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/piper_install":
             self._send_json(install_piper_voice(payload.get("voice")))
+
+        elif self.path == "/api/whisper_install":
+            self._send_json(install_whisper(payload.get("model") or get_settings()["ai_whisper_model"]))
 
         elif self.path == "/api/ai_rescan":
             scan_start_apps()

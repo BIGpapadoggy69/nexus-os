@@ -140,7 +140,7 @@ alles in **einer einzigen Python-Datei**, ohne eine einzige externe Abhängigkei
 <summary><b>🎙️ NEXUS AI: Sprachassistent „Hey Nexus“</b></summary>
 
 - **Wakeword „Hey Nexus“** (auch „Hallo“ oder „Okay Nexus“): kurz sagen, Ding abwarten, Befehl sprechen. Oder alles in einem Satz.
-- **Spracherkennung komplett offline** über die in Windows eingebaute deutsche Spracherkennung.
+- **Spracherkennung komplett offline:** „Hey Nexus“ hört die in Windows eingebaute deutsche Spracherkennung. Was danach kommt, schreibt auf Wunsch [Whisper](https://github.com/SYSTRAN/faster-whisper) mit und versteht damit auch freie Sätze, Namen und Umgangssprache. Einmal in der Ansicht *Nexus AI* laden (Modell „Genau“ mit Engine ca. 760 MB); kurze, eindeutige Befehle wie „Mach lauter“ laufen weiter sofort über Windows.
 - **Natürliche Stimmen:** neuronale Offline-Stimmen über [Piper](https://github.com/OHF-Voice/piper1-gpl) – Kerstin, Ramona (weiblich) oder Thorsten (männlich). Auswählen genügt: NEXUS lädt die Stimme einmalig herunter (63–114 MB) und antwortet danach in ca. 0,2 s. Ohne Download sprechen die Windows-Stimmen (z.B. Katja).
 - Stimmlage (Gemütlich, Normal, Lebhaft) und Signalton (Sanft, Warm, Tropfen oder Aus) lassen sich wählen und vorher anhören.
 - **Links & Suchen im Lieblingsbrowser:** Brave, Chrome, Edge, Firefox oder der Windows-Standard; Browser starten dabei mit normalen Rechten, nicht als Admin.
@@ -330,8 +330,8 @@ In der Suche funktionieren außerdem Rechnungen (`=2^10/4`) und Websuchen: einfa
 - Die Oberfläche läuft **nur lokal** auf `127.0.0.1` mit zufälligem Port, nichts ist aus dem Netzwerk erreichbar.
 - Jeder Start erzeugt einen **geheimen Token**. Fremde Webseiten können die API deshalb nicht ansprechen, ein Host-Check blockt DNS-Rebinding.
 - Alle Eingaben werden geprüft, bevor sie in PowerShell- oder Registry-Befehlen landen.
-- **Keine Telemetrie, keine Cloud, kein Account.** Ins Internet geht das Tool nur für Schriftarten (Google Fonts), den Speedtest (Cloudflare), Pings sowie winget/ffmpeg/Ollama-Downloads, wenn du sie benutzt.
-- **Das Mikrofon ist standardmäßig aus.** Erst mit „Auf Hey Nexus hören“ lauscht NEXUS, und zwar lokal über die Windows-Spracherkennung. Audio verlässt nie den PC, Unterhaltungen werden nicht gespeichert. Solange das Mikrofon an ist, zeigt Windows wie gewohnt das Mikrofon-Symbol in der Taskleiste.
+- **Keine Telemetrie, keine Cloud, kein Account.** Ins Internet geht das Tool nur für Schriftarten (Google Fonts), den Speedtest (Cloudflare), Pings sowie winget/ffmpeg/Ollama/Piper/Whisper-Downloads, wenn du sie benutzt.
+- **Das Mikrofon ist standardmäßig aus.** Erst mit „Auf Hey Nexus hören“ lauscht NEXUS, und zwar lokal über die Windows-Spracherkennung (und, falls geladen, Whisper). Audio verlässt nie den PC, Unterhaltungen werden nicht gespeichert. Solange das Mikrofon an ist, zeigt Windows wie gewohnt das Mikrofon-Symbol in der Taskleiste.
 
 **Wo liegen meine Daten?**
 
@@ -340,7 +340,7 @@ In der Suche funktionieren außerdem Rechnungen (`=2^10/4`) und Websuchen: einfa
 | `%APPDATA%\NexusOS\user_data.json` | Workspaces, Erinnerungen, Notizen, Bausteine, Befehle, Automationen, Einstellungen |
 | `%PROGRAMDATA%\NexusOS\original_ids.json` | Gesicherte Original-Werte für „Alles auf Original“ |
 | `%APPDATA%\NexusOS\backgrounds\` | Deine hochgeladenen Hintergründe (Kopien, die Originale bleiben, wo sie sind) |
-| `%APPDATA%\NexusOS\ai\` | Sprach-Engine (wird beim ersten Start kompiliert), Wortschatz für die Erkennung und, falls gewählt, natürliche Piper-Stimmen |
+| `%APPDATA%\NexusOS\ai\` | Sprach-Engine (wird beim ersten Start kompiliert), Wortschatz für die Erkennung und, falls gewählt, natürliche Piper-Stimmen und Whisper |
 
 > [!WARNING]
 > Notizen und Text-Bausteine liegen als Klartext auf der Platte, also bitte keine Passwörter speichern. **Custom Commands laufen mit Admin-Rechten:** Füge nur Befehle ein, die du verstehst.
@@ -356,6 +356,14 @@ In der Suche funktionieren außerdem Rechnungen (`=2^10/4`) und Websuchen: einfa
 - **Windows-Einstellungen → Datenschutz → Mikrofon:** „Desktop-Apps den Zugriff erlauben“ muss an sein, und das richtige Mikrofon muss als Standardgerät eingestellt sein.
 - Fehlt die deutsche Spracherkennung, zeigt NEXUS das direkt an. Nachinstallieren unter *Zeit und Sprache → Sprache → Deutsch → Optionen*.
 - Stell die Empfindlichkeit auf **„Empfindlich“** und betone das „Nexus“. Mit <kbd>Strg</kbd>+<kbd>Leertaste</kbd> geht's auch ganz ohne Wakeword.
+</details>
+
+<details>
+<summary><b>NEXUS versteht mich falsch.</b></summary>
+
+- Lade in der Ansicht *Nexus AI* unter **Spracherkennung** einmalig Whisper. Die Windows-Erkennung allein kommt mit freien Sätzen kaum zurecht.
+- **„Genau“** ist der beste Kompromiss. **„Schnell“** antwortet flotter, verhört sich aber öfter; **„Sehr genau“** lohnt sich nur auf starken PCs.
+- Bei langen Sätzen erst „Hey Nexus“ sagen, Ding abwarten, dann sprechen. In einem Atemzug schneidet Windows das Ende sonst manchmal ab.
 </details>
 
 <details>
